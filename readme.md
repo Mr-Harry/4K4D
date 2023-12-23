@@ -32,7 +32,7 @@ After setting up the environment, you should execute the installation command in
 pip install -e . --no-build-isolation --no-deps
 ```
 
-Note that it's not neccessary for all requirements present in [environment.yml](environment.yml) and [requirements.txt](requirements.txt) to be installed on your system as they contain dependencies for other parts of ***EasyVolcap***. Thanks to the modular design of ***EasyVolcap***, this missing packages will not hinder the rendering and training of *4K4D*.
+Note that it's not necessary for all requirements present in [environment.yml](environment.yml) and [requirements.txt](requirements.txt) to be installed on your system as they contain dependencies for other parts of ***EasyVolcap***. Thanks to the modular design of ***EasyVolcap***, this missing packages will not hinder the rendering and training of *4K4D*.
 After the installation process, we're expecting *PyTorch*, *PyTorch3D* and *tiny-cuda-nn* to be present in the current system for the rendering of *4K4D* to work properly.
 For the training of *4K4D*, you should also make sure that *Open3D* is properly installed.
 Other packages can be easily installed using `pip` if errors about their import are encountered.
@@ -71,21 +71,22 @@ vhulls # OPTIONAL: extracted visual hull: vhulls/000000.ply, vhulls/000001.ply .
 surfs # OPTIONAL: processed visual hull: surfs/000000.ply, surfs/000001.ply ...
 ```
 
-### DNA-Rendering, NHR and ZJU-Mocap Datasets
+### DNA-Rendering, NHR and ZJU-MoCap Datasets
 
-Please refer to [*Im4D*'s guide](https://github.com/zju3dv/im4d#set-up-datasets) to download ZJU-Mocap, NHR and DNA-Rendering datasets.
+Please refer to [*Im4D*'s guide](https://github.com/zju3dv/im4d#set-up-datasets) to download ZJU-MoCap, NHR and DNA-Rendering datasets.
 After downloading, the extracted files should be placed in to `data/my_zjumocap`, `data/NHR` and `data/renbody` respectively.
-If someone is interested in the processed data, please email me at [zhenx@zju.edu.cn](mailto://zhenx@zju.edu.cn) and CC [xwzhou@zju.edu.cn](xwzhou@zju.edu.cn) and [pengsida@zju.edu.cn](pengsida@zju.edu.cn) to request the download link.
+If someone is interested in the processed data, please email me at [zhenx@zju.edu.cn](mailto://zhenx@zju.edu.cn) and CC [xwzhou@zju.edu.cn](xwzhou@zju.edu.cn) and [pengsida@zju.edu.cn](pengsida@zju.edu.cn) to request the processing guide.
+For ZJU-MoCap, you can fill in [this Google form](https://docs.google.com/forms/d/e/1FAIpQLSdmXJkGB8E4DoSZ80VyB9vfnIJZeaGf8NS2nkLozHSU1MaQzA/viewform?usp=sf_link) to request the download link.
 Note that you should cite the corresponding papers if you use these datasets.
 
 ### ENeRF-Outdoor Dataset
 
-If someone is interested in downloading the ENeRF-Outdoor dataset, please email me at [zhenx@zju.edu.cn](mailto://zhenx@zju.edu.cn) and CC [xwzhou@zju.edu.cn](xwzhou@zju.edu.cn), [pengsida@zju.edu.cn](pengsida@zju.edu.cn) and [haotongl@zju.edu.cn](haotongl@zju.edu.cn) to request the download link. Note that this dataset is for non-commercial use only.
+If someone is interested in downloading the ENeRF-Outdoor dataset, please fill in [this Google form](https://docs.google.com/forms/d/e/1FAIpQLSeFAgcnJEDYEaco4vA2QsD-bM8V8CRFuiR0QWbi_3uXmXtUKg/viewform?usp=sf_link) to request the download link. Note that this dataset is for non-commercial use only.
 After downloading, the extracted files should be placed in `data/enerf_outdoor`.
 
 ### Mobile-Stage Dataset
 
-If someone is interested in downloading the Mobile-Stage dataset, please email me at [zhenx@zju.edu.cn](mailto://zhenx@zju.edu.cn) and CC [xwzhou@zju.edu.cn](xwzhou@zju.edu.cn) and [pengsida@zju.edu.cn](pengsida@zju.edu.cn) to request the download link. Note that this dataset is for non-commercial use only.
+If someone is interested in downloading the Mobile-Stage dataset, please fill in [this Google form](https://docs.google.com/forms/d/e/1FAIpQLSeEbjuTV7w0lfryl-9FPX1VteuPGkbqjDvxXebY02Tm6BMejQ/viewform?usp=sf_link) to request the download link. Note that this dataset is for non-commercial use only.
 After downloading, the extracted files should be placed in `data/mobile_stage`.
 
 ## Rendering
