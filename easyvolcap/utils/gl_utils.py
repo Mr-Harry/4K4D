@@ -289,10 +289,10 @@ class Mesh:
             if self.render_type == Mesh.RenderType.TRIS: est_tri_norms()
             elif self.render_type == Mesh.RenderType.POINTS: est_pcd_norms()
             else:
-                log(yellow(f'Unsupported mesh type: {self.render_type} for normal estimation, skipping'))
+                # log(yellow(f'Unsupported mesh type: {self.render_type} for normal estimation, skipping'))
                 self.normals = self.verts
         else:
-            log(yellow(f'Number of points for mesh too large: {len(self.verts)} > {self.est_normal_thresh}, skipping normal estimation'))
+            # log(yellow(f'Number of points for mesh too large: {len(self.verts)} > {self.est_normal_thresh}, skipping normal estimation'))
             self.normals = self.verts
 
     def offscreen_render(self, eglctx: "eglContextManager", camera: Camera):
@@ -432,11 +432,11 @@ class Quad(Mesh):
         self.update_gl_buffers()
         self.compile_shaders()
 
-        self.max_H, self.max_W = 0, 0
+        self.max_H, self.max_W = H, W
         self.H, self.W = H, W
         self.compose = compose
         self.compose_power = compose_power
-        self.resize_textures(H, W)
+        self.init_texture()
 
     @property
     def n_faces_bytes(self): return 0
@@ -460,7 +460,7 @@ class Quad(Mesh):
     def resize_textures(self, H: int, W: int):  # analogy to update_gl_buffers
         self.H, self.W = H, W
         if self.H > self.max_H or self.W > self.max_W:  # max got updated
-            self.max_H, self.max_W = max(int(self.H * 1.0), self.max_H), max(int(self.W * 1.0), self.max_W)
+            self.max_H, self.max_W = max(int(self.H * 1.05), self.max_H), max(int(self.W * 1.05), self.max_W)
             self.init_texture()
 
     def init_texture(self):
@@ -896,9 +896,9 @@ class Splat(Mesh):
         self.point_smooth = point_smooth
         self.alpha_blending = alpha_blending
 
-        self.max_H, self.max_W = 0, 0
+        self.max_H, self.max_W = H, W
         self.H, self.W = H, W
-        self.resize_textures(H, W)
+        self.init_textures()
 
     @property
     def verts_data(self):  # a heavy copy operation
@@ -1065,7 +1065,7 @@ class Splat(Mesh):
     def resize_textures(self, H: int, W: int):  # analogy to update_gl_buffers
         self.H, self.W = H, W
         if self.H > self.max_H or self.W > self.max_W:  # max got updated
-            self.max_H, self.max_W = max(int(self.H * 1.0), self.max_H), max(int(self.W * 1.0), self.max_W)
+            self.max_H, self.max_W = max(int(self.H * 1.05), self.max_H), max(int(self.W * 1.05), self.max_W)
             self.init_textures()
 
     def init_textures(self):
