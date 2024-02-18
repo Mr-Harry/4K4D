@@ -4,8 +4,7 @@ import cv2
 import torch
 import numpy as np
 import pkg_resources
-from os.path import join, abspath
-from easyvolcap.utils.base_utils import dotdict
+from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.data_utils import to_numpy
 
 
@@ -16,12 +15,12 @@ class FileStorage(object):
         self.second_version = int(version.split('.')[1])
 
         if isWrite:
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            os.makedirs(dirname(filename), exist_ok=True)
             self.fs = open(filename, 'w')
             self.fs.write('%YAML:1.0\r\n')
             self.fs.write('---\r\n')
         else:
-            assert os.path.exists(filename), filename
+            assert exists(filename), filename
             self.fs = cv2.FileStorage(filename, cv2.FILE_STORAGE_READ)
         self.isWrite = isWrite
 
@@ -77,10 +76,10 @@ class FileStorage(object):
 
 def read_camera(intri_path: str, extri_path: str = None, cam_names=[]) -> dotdict:
     if extri_path is None:
-        extri_path = os.path.join(intri_path, 'extri.yml')
-        intri_path = os.path.join(intri_path, 'intri.yml')
-    assert os.path.exists(intri_path), intri_path
-    assert os.path.exists(extri_path), extri_path
+        extri_path = join(intri_path, 'extri.yml')
+        intri_path = join(intri_path, 'intri.yml')
+    assert exists(intri_path), intri_path
+    assert exists(extri_path), extri_path
 
     intri = FileStorage(intri_path)
     extri = FileStorage(extri_path)
@@ -90,8 +89,8 @@ def read_camera(intri_path: str, extri_path: str = None, cam_names=[]) -> dotdic
         # Intrinsics
         cams[cam] = dotdict()
         cams[cam].K = intri.read('K_{}'.format(cam))
-        cams[cam].H = intri.read('H_{}'.format(cam), dt='real') or -1
-        cams[cam].W = intri.read('W_{}'.format(cam), dt='real') or -1
+        cams[cam].H = int(intri.read('H_{}'.format(cam), dt='real')) or -1
+        cams[cam].W = int(intri.read('W_{}'.format(cam), dt='real')) or -1
         cams[cam].invK = np.linalg.inv(cams[cam]['K'])
 
         # Extrinsics
@@ -138,10 +137,9 @@ def read_camera(intri_path: str, extri_path: str = None, cam_names=[]) -> dotdic
     return dotdict(cams)
 
 
-def write_camera(cameras: dict, path: str, intri_path: str = '', extri_path: str = ''):
-    from os.path import join
+def write_camera(cameras: dict, path: str, intri_name: str = '', extri_name: str = ''):
     os.makedirs(path, exist_ok=True)
-    if not intri_path or not extri_path:
+    if not intri_name or not extri_name:
         intri_name = join(path, 'intri.yml')  # TODO: make them arguments
         extri_name = join(path, 'extri.yml')
     intri = FileStorage(intri_name, True)
@@ -199,7 +197,7 @@ def write_camera(cameras: dict, path: str, intri_path: str = '', extri_path: str
 def to_easymocap(Ks: torch.Tensor, Hs: torch.Tensor, Ws: torch.Tensor,
                  Rs: torch.Tensor, Ts: torch.Tensor, ts: torch.Tensor,
                  ns: torch.Tensor, fs: torch.Tensor, Ds: torch.Tensor = None,
-                 cam_digit: int = 5):
+                 cam_digit: int = 6):
     # Number of render views
     n_render_views = Ks.shape[0]
 

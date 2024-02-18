@@ -11,7 +11,7 @@ from easyvolcap.engine import cfg, args  # global
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.base_utils import dotdict
 from easyvolcap.utils.easy_utils import read_camera, to_easymocap, write_camera
-from easyvolcap.utils.net_utils import affine_inverse, torch_inverse_3x3, affine_padding
+from easyvolcap.utils.math_utils import affine_inverse, torch_inverse_3x3, affine_padding
 from easyvolcap.utils.data_utils import get_rays, DataSplit, get_near_far, as_torch_func, export_camera
 from easyvolcap.utils.cam_utils import generate_hemispherical_orbit, interpolate_camera_path, interpolate_camera_lins, generate_spiral_path, Interpolation
 
@@ -30,7 +30,7 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
                  # Hemisphere or custom camera path
                  interp_type: str = Interpolation.ORBIT.name,  # Interpolation.CUBIC or Interpolation.LINEAR
                  interp_cfg: dotdict = dotdict(
-                     orbit_radius=None,  # if None, will use the avearge radius
+                     orbit_radius=-1,  # if < 0, will use the avearge radius
                      orbit_height=0.,  # sphere_height shift
                      smoothing_term=-1.0,  # negativa values -> compute spiral path, otherwise just interpolate
                  ),
@@ -48,7 +48,7 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
                  camera_path_extri: str = None,  # path to extri.yml
 
                  save_interp_path: bool = True,  # save the interpolated path, find it is useful too
-                 render_path_root: str = None,  # root path for saving the interpolated render path
+                 render_path_root: str = 'data/novel_view',  # root path for saving the interpolated render path
                  **kwargs,
                  ):
         # NOTE: no super().__init__() since these datasets are fundamentally different
@@ -62,7 +62,7 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
         self.interp_type = Interpolation[interp_type]
         self.interp_cfg = interp_cfg
         self.interp_using_t = interp_using_t
-        self.temporal_range_overwrite = temporal_range
+        self.temporal_range_overwrite = temporal_range if not interp_using_t else [0]
         self.input_Ks = self.Ks.clone()  # for exporting camera paths
         self.input_c2ws = self.c2ws.clone()
         self.load_interpolations()
@@ -159,9 +159,11 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
         elif self.interp_type == Interpolation.SPIRAL:
             self.c2ws = as_torch_func(generate_spiral_path)(self.c2ws, self.n_render_views, **self.interp_cfg)
         elif self.interp_type == Interpolation.SECTOR:
-            pass
+            pass  # TODO: Implement this
         elif self.interp_type == Interpolation.NONE:
-            pass
+            if len(self.c2ws) != self.n_render_views:
+                log(yellow(f'The number of views in the camera path ({blue(len(self.c2ws))}) does not match the number of views to render ({blue(self.n_render_views)}), will use the one in the camera path ({blue(len(self.c2ws))})'))
+            self.n_render_views = len(self.c2ws)
         else:
             raise NotImplementedError
 
@@ -180,16 +182,18 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
         if self.interp_using_t: self.Ks, self.Hs, self.Ws, self.ns, self.fs = self.Ks[0], self.Hs[0], self.Ws[0], self.ns[0], self.fs[0]
         else: self.Ks, self.Hs, self.Ws, self.ns, self.fs = self.Ks[:, 0], self.Hs[:, 0], self.Ws[:, 0], self.ns[:, 0], self.fs[:, 0]
 
-        self.Ks = torch.as_tensor(interpolate_camera_lins(self.Ks.float().view(-1, 9).numpy(), self.n_render_views, **self.interp_cfg)).view(-1, 3, 3)
-        self.Hs = torch.as_tensor(interpolate_camera_lins(self.Hs.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1).int()
-        self.Ws = torch.as_tensor(interpolate_camera_lins(self.Ws.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1).int()
-        self.ns = torch.as_tensor(interpolate_camera_lins(self.ns.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1)
-        self.fs = torch.as_tensor(interpolate_camera_lins(self.fs.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1)
+        if self.interp_type != Interpolation.NONE:
+
+            self.Ks = torch.as_tensor(interpolate_camera_lins(self.Ks.float().view(-1, 9).numpy(), self.n_render_views, **self.interp_cfg)).view(-1, 3, 3)
+            self.Hs = torch.as_tensor(interpolate_camera_lins(self.Hs.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1).int()
+            self.Ws = torch.as_tensor(interpolate_camera_lins(self.Ws.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1).int()
+            self.ns = torch.as_tensor(interpolate_camera_lins(self.ns.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1)
+            self.fs = torch.as_tensor(interpolate_camera_lins(self.fs.float().view(-1, 1).numpy(), self.n_render_views, **self.interp_cfg)).view(-1)
 
         # Add skeleton dimension for reusing camera parameter loading mechanism
         self.Ks = self.Ks[:, None].expand(-1, self.n_latents, -1, -1)  # (V, F, 3, 3)
-        self.Hs = self.Hs[:, None].expand(-1, self.n_latents)  # (V, F)
-        self.Ws = self.Ws[:, None].expand(-1, self.n_latents)  # (V, F)
+        self.Hs = self.Hs[:, None].expand(-1, self.n_latents).int()  # (V, F)
+        self.Ws = self.Ws[:, None].expand(-1, self.n_latents).int()  # (V, F)
         self.ns = self.ns[:, None].expand(-1, self.n_latents)  # (V, F)
         self.fs = self.fs[:, None].expand(-1, self.n_latents)  # (V, F)
 
@@ -213,20 +217,20 @@ class VolumetricVideoInferenceDataset(VolumetricVideoDataset):
 
         if self.render_path_root is None:
             if self.camera_path_intri is not None:
-                self.render_path_root = os.path.dirname(self.camera_path_intri)
+                self.render_path_root = dirname(self.camera_path_intri)
         else:
             try: save_tag = cfg.runner_cfg.visualizer_cfg.save_tag  # MARK: GLOBAL
             except: save_tag = ''
             self.render_path_root = join(self.render_path_root, cfg.exp_name)  # MARK: GLOBAL
-            if save_tag != '': self.render_path_root = join(self.render_path_root, save_tag)
+            if save_tag != '': self.render_path_root = join(self.render_path_root, str(save_tag))
 
         # Save the interpolated paths otherwise
         render_path_cams = to_easymocap(self.Ks, self.Hs, self.Ws, self.Rs, self.Ts, self.ts, self.ns, self.fs)
         write_camera(render_path_cams, self.render_path_root)
 
         # Save the visualized camera paths
-        export_camera(self.input_c2ws, self.input_Ks, filename=join(self.render_path_root, 'input_camera.ply'))
-        export_camera(self.c2ws, self.Ks, filename=join(self.render_path_root, 'interp_camera.ply'))
+        export_camera(self.input_c2ws[:, 0], self.input_Ks[:, 0], filename=join(self.render_path_root, 'input_camera.ply'))
+        export_camera(self.c2ws[:, 0], self.Ks[:, 0], filename=join(self.render_path_root, 'interp_camera.ply'))
 
     def get_indices(self, index: int):
         view_index = index

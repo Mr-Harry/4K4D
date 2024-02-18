@@ -41,11 +41,15 @@ from easyvolcap.engine import DATASETS
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.timer_utils import timer
 from easyvolcap.utils.base_utils import dotdict
+from easyvolcap.utils.ray_utils import get_rays
 from easyvolcap.utils.easy_utils import read_camera
+from easyvolcap.utils.ray_utils import weighted_sample_rays
 from easyvolcap.utils.parallel_utils import parallel_execution
+from easyvolcap.utils.vhull_utils import hierarchically_carve_vhull
 from easyvolcap.utils.cam_utils import average_c2ws, align_c2ws, average_w2cs
 from easyvolcap.utils.dist_utils import get_rank, get_world_size, get_distributed
-from easyvolcap.utils.net_utils import weighted_sample_rays, affine_inverse, affine_padding, torch_inverse_3x3, hierarchically_carve_vhull, get_bound_2d_bound, crop_using_xywh, get_bounds, fill_nhwc_image, point_padding, monotonic_near_far, get_rays
+from easyvolcap.utils.math_utils import affine_inverse, affine_padding, torch_inverse_3x3, point_padding
+from easyvolcap.utils.bound_utils import get_bound_2d_bound, get_bounds, monotonic_near_far, get_bound_3d_near_far
 from easyvolcap.utils.data_utils import DataSplit, UnstructuredTensors, load_resize_undist_ims_bytes, load_image_from_bytes, as_torch_func, to_cuda, to_cpu, to_tensor, export_pts, load_pts, decode_crop_fill_ims_bytes, decode_fill_ims_bytes
 
 cv2.setNumThreads(1)  # MARK: only 1 thread for opencv undistortion, high cpu, not faster
@@ -65,31 +69,50 @@ class VolumetricVideoDataset(Dataset):
                  view_sample: List = [0, None, 1],  # begin, end, step
                  frame_sample: List = [0, None, 1],  # begin, end, step
                  correct_pix: bool = True,  # move pixel coordinates to the middle of the pixel
-                 use_default_time: bool = False,  # use the time provided by the datasets, rare
+                 use_loaded_time: bool = False,  # use the time provided by the datasets, rare
 
                  # Other default configurations
                  intri_file: str = 'intri.yml',
                  extri_file: str = 'extri.yml',
-                 masks_dir: str = 'masks',  # TODO: for new datasets, rename this to masks
-                 images_dir: str = 'images',  # why an s?
-                 camera_dir: str = 'cameras',  # only for monocular dataset
+                 images_dir: str = 'images',
+                 cameras_dir: str = 'cameras',  # only when the camera is moving through time
                  ims_pattern: str = '{frame:06d}.jpg',
                  imsize_overwrite: List[int] = [-1, -1],  # overwrite the image size
 
                  # Camera alignment
-                 use_aligned_cameras: bool = True,
+                 use_aligned_cameras: bool = False,
                  avg_using_all: bool = False,  # ok enough for now
                  avg_max_count: int = 100,  # prevent slow center of attention computation
                  init_viewer_index: int = 0,
                  use_avg_init_viewer: bool = False,  # use average camera as initial viewer
 
-                 # Image preprocessing & formatting
+                 # Mask related configs
+                 masks_dir: str = 'masks',
                  use_masks: bool = False,
-                 mask_bkgd: float = 0.0,  # fill bkgd with this value, None means no fill # FIXME: different behavior for training and validation
                  bkgd_weight: float = 1.0,  # fill bkgd weight with 1.0s
                  imbound_crop: bool = False,
                  immask_crop: bool = False,
                  immask_fill: bool = False,
+
+                 # Depth related configs
+                 depths_dir: str = 'depths',
+                 use_depths: bool = False,
+
+                 # Human priors # TODO: maybe move these to a different dataset?
+                 use_smpls: bool = False,  # use smpls as prior
+                 motion_file: str = 'motion.npz',
+                 bodymodel_file: str = 'output-smpl-3d/cfg_model.yml',
+                 canonical_smpl_file: str = None,
+
+                 # Object priors
+                 use_objects_priors: bool = False,  # use foreground prior
+                 objects_bounds: List[List[float]] = None,  # manually estimated input objects bounds if there's no masks or smpls
+
+                 # Background priors # TODO: maybe move these to a different dataset?
+                 bkgds_dir: str = 'bkgd',  # for those methods who use background images
+                 use_bkgds: bool = False,  # use background images
+
+                 # Image preprocessing & formatting
                  use_z_depth: bool = False,
                  dist_opt_K: bool = True,  # use optimized K for undistortion (will crop out black edges), mostly useful for large number of images
                  encode_ext: str = '.jpg',
@@ -114,16 +137,6 @@ class VolumetricVideoDataset(Dataset):
                  reload_vhulls: bool = False,  # reload visual hulls to vhulls_dir
                  vhull_only: bool = False,
 
-                 # Human priors # TODO: maybe move these to a different dataset?
-                 use_smpls: bool = False,  # use smpls as prior
-                 motion_file: str = 'motion.npz',
-                 bodymodel_file: str = 'output-smpl-3d/cfg_model.yml',
-                 canonical_smpl_file: str = None,
-
-                 # Background priors # TODO: maybe move these to a different dataset?
-                 bkgds_dir: str = 'bkgd',  # for those methods who use background images
-                 use_bkgds: bool = False,  # use background images
-
                  # Volume based config
                  bounds: List[List[float]] = [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
                  near: float = 0.2,  # lets hope the cameras are not too close
@@ -135,6 +148,7 @@ class VolumetricVideoDataset(Dataset):
 
                  # Dynamically tunable variables
                  render_ratio: float = 1.0,  # might need to resize just before sampling
+                 render_center_crop_ratio: float = 1.0,  # might need to center crop just before sampling
                  dist_mask: List[bool] = [1] * 5,
                  skip_loading_images: bool = False,  # for debugging and visualization
 
@@ -174,9 +188,10 @@ class VolumetricVideoDataset(Dataset):
         self.use_avg_init_viewer = use_avg_init_viewer
 
         # Data and priors directories
-        self.camera_dir = camera_dir
+        self.cameras_dir = cameras_dir
         self.images_dir = images_dir
         self.masks_dir = masks_dir
+        self.depths_dir = depths_dir
         self.vhulls_dir = vhulls_dir
         self.bkgds_dir = bkgds_dir
         self.ims_pattern = ims_pattern
@@ -186,15 +201,16 @@ class VolumetricVideoDataset(Dataset):
         self.patch_size_shared = torch.as_tensor(patch_size, dtype=torch.long).share_memory_()
         self.render_ratio_shared = torch.as_tensor(render_ratio, dtype=torch.float).share_memory_()
         self.random_crop_size_shared = torch.as_tensor(random_crop_size, dtype=torch.float).share_memory_()
+        self.render_center_crop_ratio_shared = torch.as_tensor(render_center_crop_ratio, dtype=torch.float).share_memory_()
 
         # Camera and image selection
         self.frame_sample = frame_sample
         self.view_sample = view_sample
         if self.view_sample[1] is not None: self.n_view_total = self.view_sample[1]
         else: self.n_view_total = len(os.listdir(join(self.data_root, self.images_dir)))  # total number of cameras before filtering
-        if self.frame_sample[1] is not None: self.n_frame_total = self.frame_sample[1]
-        else: self.n_frame_total = min([len(glob(join(self.data_root, self.images_dir, cam, '*'))) for cam in os.listdir(join(self.data_root, self.images_dir))])  # total number of images before filtering
-        self.use_default_time = use_default_time
+        if self.frame_sample[1] is not None: self.n_frames_total = self.frame_sample[1]
+        else: self.n_frames_total = min([len(glob(join(self.data_root, self.images_dir, cam, '*'))) for cam in os.listdir(join(self.data_root, self.images_dir))])  # total number of images before filtering
+        self.use_loaded_time = use_loaded_time
 
         # Rendering and space carving bounds
         self.bounds = torch.as_tensor(bounds, dtype=torch.float)
@@ -210,6 +226,7 @@ class VolumetricVideoDataset(Dataset):
         self.ratio = ratio  # could be a float (shared ratio) or a list of floats (should match images)
         self.encode_ext = encode_ext
         self.cache_raw = cache_raw  # use raw pixels to further accelerate training
+        self.use_depths = use_depths  # use visual hulls as a prior
         self.use_vhulls = use_vhulls  # use visual hulls as a prior
         self.use_masks = use_masks  # always load mask if using vhulls
         self.use_smpls = use_smpls  # use smpls as a prior
@@ -240,6 +257,10 @@ class VolumetricVideoDataset(Dataset):
         self.remove_outlier = remove_outlier
         self.vhull_only = vhull_only
 
+        # Foreground objects prior configuration
+        self.use_objects_priors = use_objects_priors
+        self.objects_bounds = objects_bounds
+
         self.load_paths()  # load image files into self.ims
         try:
             if self.use_vhulls and not self.reload_vhulls:
@@ -253,7 +274,8 @@ class VolumetricVideoDataset(Dataset):
             pass  # silently error out if no visual hull is found here
         if not skip_loading_images:
             self.load_bytes()  # load image bytes (also load vhulls)
-        self.load_smpls()  # load smpls (if needed, branch inside)
+        if self.use_smpls:
+            self.load_smpls()  # load smpls (if needed, branch inside)
         # https://github.com/pytorch/pytorch/issues/13246#issuecomment-905703662
         # https://ppwwyyxx.com/blog/2022/Demystify-RAM-Usage-in-Multiprocess-DataLoader/
 
@@ -262,7 +284,6 @@ class VolumetricVideoDataset(Dataset):
         self.correct_pix = correct_pix
         self.use_z_depth = use_z_depth
         self.bkgd_weight = bkgd_weight
-        self.mask_bkgd = mask_bkgd
 
         # Cache related config
         self.image_cache_maxsize = image_cache_maxsize  # make this smaller to avoid oom
@@ -300,6 +321,14 @@ class VolumetricVideoDataset(Dataset):
         self.render_ratio_shared.copy_(torch.as_tensor(value, dtype=self.render_ratio_shared.dtype))  # all values will be changed to this
 
     @property
+    def render_center_crop_ratio(self):
+        return self.render_center_crop_ratio_shared
+
+    @render_center_crop_ratio.setter
+    def render_center_crop_ratio(self, value: torch.Tensor):
+        self.render_center_crop_ratio_shared.copy_(torch.as_tensor(value, dtype=self.render_center_crop_ratio_shared.dtype))  # all values will be changed to this
+
+    @property
     def n_rays(self):
         return self.n_rays_shared
 
@@ -326,16 +355,18 @@ class VolumetricVideoDataset(Dataset):
     def load_paths(self):
         # Load image related stuff for reading from disk later
         # If number of images in folder does not match, here we'll get an error
-        ims = [[join(self.data_root, self.images_dir, cam, self.ims_pattern.format(frame=i)) for i in range(self.n_frame_total)] for cam in self.camera_names]
+        ims = [[join(self.data_root, self.images_dir, cam, self.ims_pattern.format(frame=i)) for i in range(self.n_frames_total)] for cam in self.camera_names]
         if not exists(ims[0][0]):
-            ims = [[i.replace('.jpg', '.png') for i in im] for im in ims]
+            ims = [[i.replace('.' + self.ims_pattern.split('.')[-1], '.JPG') for i in im] for im in ims]
         if not exists(ims[0][0]):
-            ims = [[i.replace('.png', '.jpg') for i in im] for im in ims]
+            ims = [[i.replace('.JPG', '.png') for i in im] for im in ims]
         if not exists(ims[0][0]):
-            ims = [sorted(glob(join(self.data_root, self.images_dir, cam, '*')))[:self.n_frame_total] for cam in self.camera_names]
+            ims = [[i.replace('.png', '.PNG') for i in im] for im in ims]
+        if not exists(ims[0][0]):
+            ims = [sorted(glob(join(self.data_root, self.images_dir, cam, '*')))[:self.n_frames_total] for cam in self.camera_names]
         ims = [np.asarray(ims[i])[:min([len(i) for i in ims])] for i in range(len(ims))]  # deal with the fact that some weird dataset has different number of images
         self.ims = np.asarray(ims)  # V, N
-        self.ims_dir = join(*split(dirname(self.ims[0, 0]))[:-1])
+        self.ims_dir = join(*split(dirname(self.ims[0, 0]))[:-1])  # logging only
 
         # TypeError: can't convert np.ndarray of type numpy.str_. The only supported types are: float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint8, and bool.
         # MARK: Names stored as np.ndarray
@@ -359,7 +390,7 @@ class VolumetricVideoDataset(Dataset):
             self.Rs = self.Rs[:, self.rank::self.num_replicas]
             self.Ts = self.Ts[:, self.rank::self.num_replicas]
             self.Ds = self.Ds[:, self.rank::self.num_replicas]
-            self.ts = self.ts[:, self.rank::self.num_replicas]  # UNUSED: time index from camera, not used for now
+            self.ts = self.ts[:, self.rank::self.num_replicas]  # controlled by use_loaded_time, default false, using computed t from frame_sample
             self.Cs = self.Cs[:, self.rank::self.num_replicas]
             self.w2cs = self.w2cs[:, self.rank::self.num_replicas]
             self.c2ws = self.c2ws[:, self.rank::self.num_replicas]
@@ -379,12 +410,19 @@ class VolumetricVideoDataset(Dataset):
                 self.mks = np.asarray([mk.replace('masks', 'msk') for mk in self.mks.ravel()]).reshape(self.mks.shape)
             self.mks_dir = join(*split(dirname(self.mks[0, 0]))[:-1])
 
+        # Depth image path preparation
+        if self.use_depths:
+            self.dps = np.asarray([im.replace(self.images_dir, self.depths_dir).replace('.jpg', '.exr').replace('.png', '.exr') for im in self.ims.ravel()]).reshape(self.ims.shape)
+            if not exists(self.dps[0, 0]):
+                self.dps = np.asarray([dp.replace('.exr', 'exr') for dp in self.dps.ravel()]).reshape(self.dps.shape)
+            self.dps_dir = join(*split(dirname(self.dps[0, 0]))[:-1])  # logging only
+
         # Background image path preparation
         if self.use_bkgds:
             self.bgs = np.asarray([join(self.data_root, self.bkgds_dir, f'{cam}.jpg') for cam in self.camera_names])  # V,
             if not os.path.exists(self.bgs[0]):
                 self.bgs = np.asarray([bg.replace('.jpg', '.png') for bg in self.bgs])
-            self.bgs_dir = join(*split(dirname(self.bgs[0]))[:-1])
+            self.bgs_dir = join(*split(dirname(self.bgs[0]))[:-1])  # logging only
 
     def load_bytes(self):
         # Camera distortions are only applied on the ground truth image, the rendering model does not include these
@@ -395,6 +433,9 @@ class VolumetricVideoDataset(Dataset):
         # Need to convert to a tight data structure for access
         ori_Ks = self.Ks
         ori_Ds = self.Ds
+        # msk_Ds = ori_Ds.clone()  # this is a DNA-Rendering special
+        # msk_Ds[..., -1] = 0.0  # only use the first 4 distortion parameters for mask undistortion
+        # msk_Ds = torch.zeros_like(ori_Ds) # avoid bad distortion params
         ratio = self.imsize_overwrite if self.imsize_overwrite[0] > 0 else self.ratio  # maybe force size, or maybe use ratio to resize
         if self.use_masks:
             self.mks_bytes, self.Ks, self.Hs, self.Ws = \
@@ -405,16 +446,25 @@ class VolumetricVideoDataset(Dataset):
             self.Hs = torch.as_tensor(self.Hs)
             self.Ws = torch.as_tensor(self.Ws)
 
+        # Maybe compute visual hulls after loading the dataset
         if self.use_vhulls and not hasattr(self, 'vhulls'):
             self.load_vhulls()  # before cropping the mask (we need all the information we can get for visual hulls)
             if self.vhull_only:
                 exit(0)
 
+        # Maybe load background images here
         if self.use_bkgds:
             self.bgs_bytes, _, _, _ = \
                 load_resize_undist_ims_bytes(self.bgs, ori_Ks[:, 0].numpy(), ori_Ds[:, 0].numpy(), ratio, self.center_crop_size,
                                              f'Loading bkgd bytes for {blue(self.bgs_dir)} {magenta(self.split.name)}',
                                              dist_opt_K=self.dist_opt_K, encode_ext=self.encode_ext)
+
+        # Maybe load depth images here, using HDR
+        if self.use_depths:  # TODO: implement HDR loading
+            self.dps_bytes, self.Ks, self.Hs, self.Ws = \
+                load_resize_undist_ims_bytes(self.dps, ori_Ks.numpy(), ori_Ds.numpy(), ratio, self.center_crop_size,
+                                             f'Loading dpts bytes for {blue(self.dps_dir)} {magenta(self.split.name)}',
+                                             decode_flag=cv2.IMREAD_UNCHANGED, dist_opt_K=self.dist_opt_K, encode_ext='.exr')  # will for a grayscale read from bytes
 
         # Image pre cacheing (from disk to memory)
         self.ims_bytes, self.Ks, self.Hs, self.Ws = \
@@ -432,26 +482,32 @@ class VolumetricVideoDataset(Dataset):
             bounds = [self.get_bounds(i) for i in range(self.n_latents)]  # N, 2, 3
             bounds = torch.stack(bounds)[None].repeat(self.n_views, 1, 1, 1)  # V, N, 2, 3
             self.ims_bytes, self.mks_bytes, self.Ks, self.Hs, self.Ws, self.crop_xs, self.crop_ys = \
-                decode_crop_fill_ims_bytes(self.ims_bytes, self.mks_bytes, self.Ks.numpy(), self.Rs.numpy(), self.Ts.numpy(), bounds.numpy(), f'Cropping msks imgs for {blue(self.data_root)} {magenta(self.split.name)}')
+                decode_crop_fill_ims_bytes(self.ims_bytes, self.mks_bytes, self.Ks.numpy(), self.Rs.numpy(), self.Ts.numpy(), bounds.numpy(), f'Cropping msks imgs for {blue(self.data_root)} {magenta(self.split.name)}', encode_ext=self.encode_ext)
+            if hasattr(self, 'dps_bytes'): self.dps_bytes, self.mks_bytes, self.Ks, self.Hs, self.Ws, self.crop_xs, self.crop_ys = \
+                decode_crop_fill_ims_bytes(self.dps_bytes, self.mks_bytes, self.Ks.numpy(), self.Rs.numpy(), self.Ts.numpy(), bounds.numpy(), f'Cropping msks dpts for {blue(self.data_root)} {magenta(self.split.name)}', encode_ext=['.exr', self.encode_ext])
             self.corp_xs = torch.as_tensor(self.crop_xs)
             self.corp_ys = torch.as_tensor(self.crop_ys)
             self.Ks = torch.as_tensor(self.Ks)
             self.Hs = torch.as_tensor(self.Hs)
             self.Ws = torch.as_tensor(self.Ws)
 
+        # Only fill the background regions
         if not self.immask_crop and self.immask_fill:  # a little bit wasteful but acceptable for now
-            self.ims_bytes, self.mks_bytes = \
-                decode_fill_ims_bytes(self.ims_bytes, self.mks_bytes, f'Masking msks imgs for {blue(self.data_root)} {magenta(self.split.name)}')
+            self.ims_bytes = decode_fill_ims_bytes(self.ims_bytes, self.mks_bytes, f'Filling msks imgs for {blue(self.data_root)} {magenta(self.split.name)}', encode_ext=self.encode_ext)
+            if hasattr(self, 'dps_bytes'): self.dps_bytes = decode_fill_ims_bytes(self.dps_bytes, self.mks_bytes, f'Filling dpts imgs for {blue(self.data_root)} {magenta(self.split.name)}', encode_ext='.exr')
 
+        # To make memory access faster, store raw floats in memory
         if self.cache_raw:
             self.ims_bytes = to_tensor([load_image_from_bytes(x, normalize=True) for x in tqdm(self.ims_bytes, desc=f'Caching imgs for {blue(self.data_root)} {magenta(self.split.name)}')])  # High mem usage
-            if hasattr(self, 'mks_bytes'): self.mks_bytes = to_tensor([load_image_from_bytes(x, normalize=True) for x in tqdm(self.mks_bytes, desc=f'Caching msks for {blue(self.data_root)} {magenta(self.split.name)}')])
-            if hasattr(self, 'bg_bytes'): self.bg_bytes = to_tensor([load_image_from_bytes(x, normalize=True) for x in tqdm(self.bg_bytes, desc=f'Caching bgs for {blue(self.data_root)} {magenta(self.split.name)}')])
+            if hasattr(self, 'mks_bytes'): self.mks_bytes = to_tensor([load_image_from_bytes(x, normalize=True) for x in tqdm(self.mks_bytes, desc=f'Caching mks for {blue(self.data_root)} {magenta(self.split.name)}')])
+            if hasattr(self, 'dps_bytes'): self.dps_bytes = to_tensor([load_image_from_bytes(x, normalize=False) for x in tqdm(self.dps_bytes, desc=f'Caching dps for {blue(self.data_root)} {magenta(self.split.name)}')])
+            if hasattr(self, 'bgs_bytes'): self.bgs_bytes = to_tensor([load_image_from_bytes(x, normalize=True) for x in tqdm(self.bgs_bytes, desc=f'Caching bgs for {blue(self.data_root)} {magenta(self.split.name)}')])
         else:
             # Avoid splitting memory for bytes objects
             self.ims_bytes = UnstructuredTensors(self.ims_bytes)
             if hasattr(self, 'mks_bytes'): self.mks_bytes = UnstructuredTensors(self.mks_bytes)
-            if hasattr(self, 'bg_bytes'): self.bg_bytes = UnstructuredTensors(self.bg_bytes)
+            if hasattr(self, 'dps_bytes'): self.dps_bytes = UnstructuredTensors(self.dps_bytes)
+            if hasattr(self, 'bgs_bytes'): self.bgs_bytes = UnstructuredTensors(self.bgs_bytes)
 
     def load_vhulls(self):
 
@@ -556,44 +612,42 @@ class VolumetricVideoDataset(Dataset):
 
     def load_smpls(self):
         # Need to add or complete __getitem__ utils function if smpl paramaters other than bound are needed
-        if self.use_smpls:
-            # Import easymocap body model for type annotation
-            from easymocap.bodymodel.smplx import SMPLHModel
-            from easyvolcap.utils.data_utils import get_rigid_transform, load_dotdict
-            from easyvolcap.utils.easy_utils import load_bodymodel
 
-            # Load smpl body model
-            # self.bodymodel: SMPLHModel = load_bodymodel(self.data_root, self.bodymodel_file)
+        # Import easymocap body model for type annotation
+        from easyvolcap.utils.data_utils import get_rigid_transform, load_dotdict
 
-            # Load smpl parameters, assume only one person now, TODO: support multiple people
-            self.motion = to_tensor(load_dotdict(join(self.data_root, self.motion_file)))
+        # Load smpl body model
+        # self.bodymodel: SMPLHModel = load_bodymodel(self.data_root, self.bodymodel_file)
 
-            def get_lbs_params(i):
-                poses = self.motion.poses[i][None]  # 1, J * 3
-                shapes = self.motion.shapes[i][None]  # 1, S
-                Rh = self.motion.Rh[i][None]  # 1, 3,
-                Th = self.motion.Th[i][None]  # 1, 3,
+        # Load smpl parameters, assume only one person now, TODO: support multiple people
+        self.motion = to_tensor(load_dotdict(join(self.data_root, self.motion_file)))
 
-                # adjust the smpl pose according to the aligned camera
-                if self.use_aligned_cameras:
-                    R = torch.from_numpy(cv2.Rodrigues(Rh[0].numpy())[0])  # 3, 3
-                    Rt = torch.cat([R, Th[0].view(3, 1)], dim=1)  # 3, 4
-                    Rt = (affine_inverse(affine_padding(self.c2w_avg)) @ affine_padding(Rt))[:3, :]  # 3, 4
-                    Rh = torch.from_numpy(cv2.Rodrigues(Rt[:, :-1].numpy())[0]).view(1, 3)  # 1, 3
-                    Th = Rt[:, -1].view(1, 3)  # 1, 3
+        def get_lbs_params(i):
+            poses = self.motion.poses[i][None]  # 1, J * 3
+            shapes = self.motion.shapes[i][None]  # 1, S
+            Rh = self.motion.Rh[i][None]  # 1, 3,
+            Th = self.motion.Th[i][None]  # 1, 3,
 
-                return poses, shapes, Rh, Th
+            # adjust the smpl pose according to the aligned camera
+            if self.use_aligned_cameras:
+                R = torch.from_numpy(cv2.Rodrigues(Rh[0].numpy())[0])  # 3, 3
+                Rt = torch.cat([R, Th[0].view(3, 1)], dim=1)  # 3, 4
+                Rt = (affine_inverse(affine_padding(self.c2w_avg)) @ affine_padding(Rt))[:3, :]  # 3, 4
+                Rh = torch.from_numpy(cv2.Rodrigues(Rt[:, :-1].numpy())[0]).view(1, 3)  # 1, 3
+                Th = Rt[:, -1].view(1, 3)  # 1, 3
 
-            smpl_lbs = []
-            for i in tqdm(self.frame_inds, desc=f'Loading smpl parameters'):
-                poses, shapes, Rh, Th = get_lbs_params(i)
-                smpl_lbs.append([poses, shapes, Rh, Th])
-            poses, shapes, Rh, Th = zip(*smpl_lbs)
-            self.smpl_motions = dotdict()
-            self.smpl_motions.poses = torch.cat(poses)
-            self.smpl_motions.shapes = torch.cat(shapes)
-            self.smpl_motions.Rh = torch.cat(Rh)
-            self.smpl_motions.Th = torch.cat(Th)
+            return poses, shapes, Rh, Th
+
+        smpl_lbs = []
+        for i in tqdm(self.frame_inds, desc=f'Loading smpl parameters'):
+            poses, shapes, Rh, Th = get_lbs_params(i)
+            smpl_lbs.append([poses, shapes, Rh, Th])
+        poses, shapes, Rh, Th = zip(*smpl_lbs)
+        self.smpl_motions = dotdict()
+        self.smpl_motions.poses = torch.cat(poses)
+        self.smpl_motions.shapes = torch.cat(shapes)
+        self.smpl_motions.Rh = torch.cat(Rh)
+        self.smpl_motions.Th = torch.cat(Th)
 
     def load_cameras(self):
         # Load camera related stuff like image list and intri, extri.
@@ -602,21 +656,21 @@ class VolumetricVideoDataset(Dataset):
         if exists(join(self.data_root, self.intri_file)) and exists(join(self.data_root, self.extri_file)):
             self.cameras = read_camera(join(self.data_root, self.intri_file), join(self.data_root, self.extri_file))
             self.camera_names = np.asarray(sorted(list(self.cameras.keys())))  # NOTE: sorting camera names
-            self.cameras = dotdict({k: [self.cameras[k] for i in range(self.n_frame_total)] for k in self.camera_names})
+            self.cameras = dotdict({k: [self.cameras[k] for i in range(self.n_frames_total)] for k in self.camera_names})
             # TODO: Handle avg processing
 
         # Monocular dataset loading, each camera has a separate folder
-        elif exists(join(self.data_root, self.camera_dir)):
-            self.camera_names = np.asarray(sorted(os.listdir(join(self.data_root, self.camera_dir))))  # NOTE: sorting here is very important!
+        elif exists(join(self.data_root, self.cameras_dir)):
+            self.camera_names = np.asarray(sorted(os.listdir(join(self.data_root, self.cameras_dir))))  # NOTE: sorting here is very important!
             self.cameras = dotdict({
                 k: [v[1] for v in sorted(
-                    read_camera(join(self.data_root, self.camera_dir, k, self.intri_file),
-                                join(self.data_root, self.camera_dir, k, self.extri_file)).items()
+                    read_camera(join(self.data_root, self.cameras_dir, k, self.intri_file),
+                                join(self.data_root, self.cameras_dir, k, self.extri_file)).items()
                 )] for k in self.camera_names
             })
             # TODO: Handle avg export and loading for such monocular dataset
         else:
-            raise NotImplementedError(f'Could not find [intri.yml, extri.yml] or [cameras] folder in {self.data_root}, check your dataset configuration')
+            raise NotImplementedError(f'Could not find {{{self.intri_file},{self.extri_file}}} or {self.cameras_dir} directory in {self.data_root}, check your dataset configuration')
 
         # Expectation:
         # self.camera_names: a list containing all camera names
@@ -677,14 +731,14 @@ class VolumetricVideoDataset(Dataset):
         if len(self.view_sample) != 3: view_inds = view_inds[self.view_sample]  # this is a list of indices
         else: view_inds = view_inds[self.view_sample[0]:self.view_sample[1]:self.view_sample[2]]  # begin, start, end
         self.view_inds = view_inds
-        if len(view_inds) == 1: view_inds = [view_inds]  # FIXME: pytorch indexing bug, when length is 1, will reduce a dim
+        if len(view_inds) == 1: view_inds = [view_inds]  # MARK: pytorch indexing bug, when length is 1, will reduce a dim
 
         # Perform frame selection next
         frame_inds = torch.arange(self.Ks.shape[1])
         if len(self.frame_sample) != 3: frame_inds = frame_inds[self.frame_sample]
         else: frame_inds = frame_inds[self.frame_sample[0]:self.frame_sample[1]:self.frame_sample[2]]
         self.frame_inds = frame_inds  # used by `load_smpls()`
-        if len(frame_inds) == 1: frame_inds = [frame_inds]  # FIXME: pytorch indexing bug, when length is 1, will reduce a dim
+        if len(frame_inds) == 1: frame_inds = [frame_inds]  # MARK: pytorch indexing bug, when length is 1, will reduce a dim
 
         # NOTE: if view_inds == [0,] in monocular dataset or whatever case, type(`self.camera_names[view_inds]`) == str, not a list of str
         self.camera_names = np.asarray([self.camera_names[view] for view in view_inds])  # this is what the b, e, s means
@@ -734,17 +788,22 @@ class VolumetricVideoDataset(Dataset):
         else:
             mk_bytes, wt_bytes = None, None
 
+        if self.use_depths:
+            dp_bytes = self.dps_bytes[view_index * self.n_latents + latent_index]
+        else:
+            dp_bytes = None
+
         if self.use_bkgds:
             bg_bytes = self.bgs_bytes[view_index]
         else:
             bg_bytes = None
 
-        return im_bytes, mk_bytes, wt_bytes, bg_bytes  # TODO: Refactor this
+        return im_bytes, mk_bytes, wt_bytes, dp_bytes, bg_bytes
 
     def get_image(self, view_index: int, latent_index: int):
         # Load bytes (rgb, msk, wet, bg)
-        im_bytes, mk_bytes, wt_bytes, bg_bytes = self.get_image_bytes(view_index, latent_index)
-        rgb, msk, wet, bg = None, None, None, None
+        im_bytes, mk_bytes, wt_bytes, dp_bytes, bg_bytes = self.get_image_bytes(view_index, latent_index)
+        rgb, msk, wet, dpt, bkg = None, None, None, None, None
 
         # Load image from bytes
         if self.cache_raw:
@@ -757,10 +816,7 @@ class VolumetricVideoDataset(Dataset):
             if self.cache_raw:
                 msk = torch.as_tensor(mk_bytes)
             else:
-                msk = torch.as_tensor(load_image_from_bytes(mk_bytes, normalize=True))
-            if self.split == DataSplit.VAL and self.mask_bkgd is not None:  # could be zero though
-                # rgb[~(msk > 0.5)[..., 0]] = self.mask_bkgd  # fill bkgd pixels
-                rgb = rgb * msk + (1 - msk) * self.mask_bkgd
+                msk = torch.as_tensor(load_image_from_bytes(mk_bytes, normalize=True)[..., :1])
         else:
             msk = torch.ones_like(rgb[..., -1:])
 
@@ -769,21 +825,26 @@ class VolumetricVideoDataset(Dataset):
             if self.cache_raw:
                 wet = torch.as_tensor(wt_bytes)
             else:
-                wet = torch.as_tensor(load_image_from_bytes(wt_bytes, normalize=True))
+                wet = torch.as_tensor(load_image_from_bytes(wt_bytes, normalize=True)[..., :1])
         else:
             wet = msk.clone()
         wet[msk < self.bkgd_weight] = self.bkgd_weight
+
+        # Load depth from bytes
+        if dp_bytes is not None:
+            if self.cache_raw:
+                dpt = torch.as_tensor(dp_bytes)
+            else:
+                dpt = torch.as_tensor(load_image_from_bytes(dp_bytes, normalize=False)[..., :1])  # readin as is
 
         # Load background image from bytes
         if bg_bytes is not None:
             bg_bytes = self.bgs_bytes[view_index]
             if self.cache_raw:
-                bg = torch.as_tensor(bg_bytes)
+                bkg = torch.as_tensor(bg_bytes)
             else:
-                bg = torch.as_tensor(load_image_from_bytes(bg_bytes, normalize=True))
-        else:
-            bg = None
-        return rgb, msk, wet, bg
+                bkg = torch.as_tensor(load_image_from_bytes(bg_bytes, normalize=True))
+        return rgb, msk, wet, dpt, bkg
 
     def get_camera_params(self, view_index, latent_index):
         latent_index = self.virtual_to_physical(latent_index)
@@ -812,6 +873,54 @@ class VolumetricVideoDataset(Dataset):
         smpl_Th = self.smpl_motions.Th[latent_index]
         return smpl_poses, smpl_shapes, smpl_Rh, smpl_Th
 
+    def get_objects_bounds(self, latent_index):
+        latent_index = self.virtual_to_physical(latent_index)
+        if self.use_vhulls: bounds = self.vhull_bounds[latent_index]  # 2, 3
+        # TODO: check the current SMPL prior implementation, it seems there's no SMPL bounds for now
+        elif self.use_smpls: raise NotImplementedError(f'No SMPL bounds for now')
+        elif self.objects_bounds is not None: bounds = torch.as_tensor(self.objects_bounds, dtype=torch.float)  # 2, 3
+        else: raise NotImplementedError(f'You must provide either vhulls or smpls or objects_bounds')
+        return bounds
+
+    def get_objects_priors(self, output: dotdict):
+        latent_index = output.meta.latent_index
+        H, W, K, R, T = output.H, output.W, output.K, output.R, output.T
+
+        # TODO: add vhulls or SMPL prior for multiple object priors supporting
+        bounds = self.get_objects_bounds(latent_index)
+        x, y, w, h = get_bound_2d_bound(bounds, K, R, T, H, W, pad=0)
+
+        # Make the height and width of the bounding box to multiply of 32
+        # Adjust the x and y coordinates of the bounding box to make it centered and do not exceed the image size
+        H, W = H if isinstance(H, int) else H.item(), W if isinstance(W, int) else W.item()
+        x, y, w_orig, h_orig = x.item(), y.item(), w.item(), h.item()
+        # Default use `ceil()`, but this may cause h > H at low-resolution, so we use `floor()` instead
+        w, h = np.ceil(w_orig / 32) * 32, np.ceil(h_orig / 32) * 32
+        if w > W or h > H: w, h = np.floor(w_orig / 32) * 32, np.floor(h_orig / 32) * 32
+        x, y = np.clip([x - (w - w_orig) // 2, y - (h - h_orig) // 2], 0, [W - w, H - h])
+        x, y, w, h = int(x), int(y), int(w), int(h)
+
+        # Get the near and far depth of the 3d bounding box
+        near, far = get_bound_3d_near_far(bounds, R, T)
+        objects_bounds, objects_xywh, objects_n, objects_f = [], [], [], []
+        objects_bounds.append(bounds)
+        objects_xywh.append(torch.tensor([x, y, w, h], dtype=torch.int))
+        objects_n.append(near)
+        objects_f.append(far)
+
+        meta = dotdict()
+        meta.objects_bounds = torch.stack(to_tensor(objects_bounds), dim=0)  # (Nf, 2, 3)
+        meta.objects_xywh = torch.stack(objects_xywh, dim=0)  # (Nf, 4)
+        meta.objects_n = torch.tensor(objects_n, dtype=torch.float)  # (Nf,)
+        meta.objects_f = torch.tensor(objects_f, dtype=torch.float)  # (Nf,)
+        # Overwrite background bounding box to the default large one
+        meta.bounds = self.bounds
+
+        # Actually store updated items
+        output.update(meta)
+        output.meta.update(meta)
+        return output
+
     @property
     def n_views(self): return len(self.cameras)
 
@@ -823,7 +932,7 @@ class VolumetricVideoDataset(Dataset):
 
     @property
     def frame_max(self):
-        middle = (self.frame_sample[1] if self.frame_sample[1] else self.n_frame_total) - 1  # None -> all frames are loaded
+        middle = (self.frame_sample[1] if self.frame_sample[1] else self.n_frames_total) - 1  # None -> all frames are loaded
         return middle if len(self.frame_sample) == 3 else max(self.frame_sample)
 
     @property
@@ -877,10 +986,8 @@ class VolumetricVideoDataset(Dataset):
         meta.n, meta.f = n, f
         meta.w2c, meta.c2w = w2c, c2w
         meta.view_index, meta.latent_index, meta.camera_index, meta.frame_index = view_index, latent_index, camera_index, frame_index
-        meta.t = t if self.use_default_time else self.frame_to_t(frame_index)
+        meta.t = t if self.use_loaded_time else self.frame_to_t(frame_index)
         meta.t = torch.as_tensor(meta.t, dtype=torch.float)  # the dataset provided time or the time fraction
-        meta.time_fraction = self.frame_to_t(frame_index)
-        meta.time_fraction = torch.as_tensor(meta.time_fraction, dtype=torch.float)  # the time fraction
         meta.v = self.camera_to_v(camera_index)
         meta.v = torch.as_tensor(meta.v, dtype=torch.float)  # the time fraction
         meta.n_rays = self.n_rays
@@ -906,6 +1013,10 @@ class VolumetricVideoDataset(Dataset):
         if self.imbound_crop:
             self.crop_ixts_bounds(output)  # only crop target ixts
 
+        # Maybe load foreground object priors
+        if self.use_objects_priors:
+            self.get_objects_priors(output)
+
         return output
 
     @staticmethod
@@ -921,8 +1032,6 @@ class VolumetricVideoDataset(Dataset):
         meta.tar_ixt = K
         meta.H = torch.as_tensor(new_h)
         meta.W = torch.as_tensor(new_w)
-        meta.full_H = torch.as_tensor(orig_h)
-        meta.full_W = torch.as_tensor(orig_w)
         if 'orig_h' in output:
             meta.crop_x = torch.as_tensor(int(output.crop_x * ratio))
             meta.crop_y = torch.as_tensor(int(output.crop_y * ratio))  # TODO: this is messy
@@ -969,11 +1078,13 @@ class VolumetricVideoDataset(Dataset):
     def get_ground_truth(self, index):
         # Load actual images, mask, sampling weights
         output = self.get_metadata(index)
-        rgb, msk, wet, _ = self.get_image(output.view_index, output.latent_index)  # H, W, 3
+        rgb, msk, wet, dpt, bkg = self.get_image(output.view_index, output.latent_index)  # H, W, 3
         H, W = rgb.shape[:2]
         output.rgb = rgb.view(-1, 3)  # full image in case you need it
         output.msk = msk.view(-1, 1)  # full mask (weights)
         output.wet = wet.view(-1, 1)  # full mask (weights)
+        if dpt is not None: output.dpt = dpt.view(-1, 1)  # full depth image
+        if bkg is not None: output.bkg = bkg.view(-1, 3)  # full background image
 
         # Maybe crop images
         if self.imbound_crop:  # crop_x has already been set by imbound_crop for ixts
@@ -988,11 +1099,13 @@ class VolumetricVideoDataset(Dataset):
             output.update(meta)
             output.meta.update(meta)
 
-        # FIXME: Should add mutex to protect this
+        # FIXME: Should add mutex to protect this， for now, multi-process and dataloading doesn't work well with each other
+        # If Moderators are used, should set num_workers to 0 for single-process data loading
         n_rays = self.n_rays
         patch_size = self.patch_size
         render_ratio = self.render_ratio
         random_crop_size = self.random_crop_size
+        render_center_crop_ratio = self.render_center_crop_ratio
 
         # Prepare for a different rendering ratio
         if (len(render_ratio.shape) and  # avoid length of 0-d tensor error, check length of shape
@@ -1003,6 +1116,8 @@ class VolumetricVideoDataset(Dataset):
             rgb = output.rgb.view(H, W, 3)
             msk = output.msk.view(H, W, 1)
             wet = output.wet.view(H, W, 1)
+            if dpt is not None: dpt = output.dpt.view(H, W, 1)
+            if bkg is not None: bkg = output.bkg.view(H, W, 3)
 
             output = self.scale_ixts(output, render_ratio)
             H, W = output.H.item(), output.W.item()
@@ -1010,9 +1125,45 @@ class VolumetricVideoDataset(Dataset):
             rgb = as_torch_func(partial(cv2.resize, dsize=(W, H), interpolation=cv2.INTER_AREA))(rgb)
             msk = as_torch_func(partial(cv2.resize, dsize=(W, H), interpolation=cv2.INTER_AREA))(msk)
             wet = as_torch_func(partial(cv2.resize, dsize=(W, H), interpolation=cv2.INTER_AREA))(wet)
+            if dpt is not None: as_torch_func(partial(cv2.resize, dsize=(W, H), interpolation=cv2.INTER_AREA))(dpt)
+            if bkg is not None: as_torch_func(partial(cv2.resize, dsize=(W, H), interpolation=cv2.INTER_AREA))(bkg)
+
             output.rgb = rgb.reshape(-1, 3)  # full image in case you need it
             output.msk = msk.reshape(-1, 1)  # full mask (weights)
             output.wet = wet.reshape(-1, 1)  # full mask (weights)
+            if dpt is not None: output.dpt = dpt.reshape(-1, 1)
+            if bkg is not None: output.bkg = bkg.reshape(-1, 1)
+
+        # Prepare for a different rendering center crop ratio
+        if (len(render_center_crop_ratio.shape) and  # avoid length of 0-d tensor error, check length of shape
+                render_center_crop_ratio[output.view_index] != 1.0) or \
+                render_center_crop_ratio != 1.0:
+            render_center_crop_ratio = self.render_center_crop_ratio[output.view_index] if len(self.render_center_crop_ratio.shape) else self.render_center_crop_ratio
+            H, W = output.H.item(), output.W.item()
+            rgb = output.rgb.view(H, W, 3)
+            msk = output.msk.view(H, W, 1)
+            wet = output.wet.view(H, W, 1)
+            if dpt is not None: dpt = output.dpt.view(H, W, 1)
+            if bkg is not None: bkg = output.bkg.view(H, W, 3)
+
+            w, h = int(W * render_center_crop_ratio), int(H * render_center_crop_ratio)
+            x, y = w // 2, h // 2
+
+            # Center crop the target image
+            rgb = rgb[y: y + h, x: x + w, :]
+            msk = msk[y: y + h, x: x + w, :]
+            wet = wet[y: y + h, x: x + w, :]
+            if dpt is not None: dpt[y: y + h, x: x + w, :]
+            if bkg is not None: bkg[y: y + h, x: x + w, :]
+
+            output.rgb = rgb.reshape(-1, 3)  # full image in case you need it
+            output.msk = msk.reshape(-1, 1)  # full mask
+            output.wet = wet.reshape(-1, 1)  # full weights
+            if dpt is not None: output.dpt = dpt.reshape(-1, 1)
+            if bkg is not None: output.bkg = bkg.reshape(-1, 1)
+
+            # Crop the intrinsics
+            self.crop_ixts(output, x, y, w, h)
 
         should_sample_patch = False
         should_crop_ixt = False
@@ -1039,6 +1190,8 @@ class VolumetricVideoDataset(Dataset):
             rgb = output.rgb.view(H, W, 3)
             msk = output.msk.view(H, W, 1)
             wet = output.wet.view(H, W, 1)
+            if dpt is not None: dpt = output.dpt.view(H, W, 1)
+            if bkg is not None: bkg = output.bkg.view(H, W, 3)
 
             # Find the Xp Yp Wp Hp to be used for random patch sampling
             # x = 0 if W - Wp <= 0 else np.random.randint(0, W - Wp + 1)
@@ -1059,9 +1212,14 @@ class VolumetricVideoDataset(Dataset):
             rgb = rgb[y: y + h, x: x + w, :]
             msk = msk[y: y + h, x: x + w, :]
             wet = wet[y: y + h, x: x + w, :]
+            if dpt is not None: dpt = dpt[y: y + h, x: x + w, :]
+            if bkg is not None: bkg = bkg[y: y + h, x: x + w, :]
+
             output.rgb = rgb.reshape(-1, 3)  # full image in case you need it
             output.msk = msk.reshape(-1, 1)  # full mask
             output.wet = wet.reshape(-1, 1)  # full weights
+            if dpt is not None: output.dpt = dpt.reshape(-1, 1)
+            if bkg is not None: output.bkg = bkg.reshape(-1, 1)
 
         if should_crop_ixt:
             # Prepare the resized ixts
@@ -1101,21 +1259,37 @@ class VolumetricVideoDataset(Dataset):
         local_timer.record('get ground truth')
         if 'ray_o' in output or self.n_rays < 0: return output  # directly return for the whole image (same for train and test)
 
-        # Sample rays
+        # Prepare weights for sampling
         H, W = output.H, output.W
         K, R, T = output.K, output.R, output.T
-        rgb, msk, wet = output.rgb.view(H, W, -1), output.msk.view(H, W, -1), output.wet.view(H, W, -1)
-        rgb, msk, wet, ray_o, ray_d, coords = weighted_sample_rays(rgb, msk, wet,
-                                                                   K, R, T,
-                                                                   self.n_rays if self.split == DataSplit.TRAIN else -1,
-                                                                   self.use_z_depth,
-                                                                   self.correct_pix)  # N, 3; N, 3; N, 3; N, 2 (100ms)
+        rgb = output.rgb.view(H, W, 3)
+        msk = output.msk.view(H, W, 1)
+        wet = output.wet.view(H, W, 1)
+        if 'dpt' in output: dpt = output.dpt.view(H, W, 1)
+        if 'bkg' in output: bkg = output.bkg.view(H, W, 3)
+
+        # Sample rays
+        ray_o, ray_d, coords = weighted_sample_rays(wet,
+                                                    K, R, T,
+                                                    self.n_rays if self.split == DataSplit.TRAIN else -1,
+                                                    self.use_z_depth,
+                                                    self.correct_pix)  # N, 3; N, 3; N, 3; N, 2 (100ms)
+
+        # Access and fetch data
+        i, j = coords.unbind(-1)
+        rgb = rgb[i, j]
+        msk = msk[i, j]
+        wet = wet[i, j]
+        if 'dpt' in output: dpt = dpt[i, j]
+        if 'bkg' in output: bkg = bkg[i, j]
         local_timer.record('weighted sample rays')
 
         # Main inputs
         output.rgb = rgb  # ground truth
         output.msk = msk
         output.wet = wet
+        if 'dpt' in output: output.dpt = dpt
+        if 'bkg' in output: output.bkg = bkg
         output.ray_o = ray_o
         output.ray_d = ray_d
         output.coords = coords
@@ -1173,4 +1347,8 @@ class VolumetricVideoDataset(Dataset):
 
         if self.imbound_crop:
             output = self.crop_ixts_bounds(output)
+
+        if self.use_objects_priors:
+            output = self.get_objects_priors(output)
+
         return output  # how about just passing through

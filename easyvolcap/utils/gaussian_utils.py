@@ -1,3 +1,4 @@
+import os
 import math
 import numpy as np
 import torch
@@ -6,10 +7,54 @@ from torch.nn import functional as F
 
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.sh_utils import eval_sh
-from easyvolcap.utils.timer_utils import timer
-from easyvolcap.utils.base_utils import dotdict
-from easyvolcap.utils.data_utils import to_x, add_batch
-from easyvolcap.utils.net_utils import make_buffer, make_params, batch_rodrigues, torch_inverse_2x2, typed
+from easyvolcap.utils.blend_utils import batch_rodrigues
+from easyvolcap.utils.data_utils import to_x, add_batch, load_pts
+from easyvolcap.utils.net_utils import make_buffer, make_params, typed
+from easyvolcap.utils.math_utils import torch_inverse_2x2, point_padding
+
+
+# def in_frustrum(xyz: torch.Tensor, ixt: torch.Tensor, ext: torch.Tensor):
+def in_frustrum(xyz: torch.Tensor, full_proj_matrix: torch.Tensor, padding: float = 0.01):
+    # __forceinline__ __device__ bool in_frustum(int idx,
+    # 	const float* orig_points,
+    # 	const float* viewmatrix,
+    # 	const float* projmatrix,
+    # 	bool prefiltered,
+    # 	float3& p_view,
+    # 	const float padding = 0.01f // padding in ndc space
+    # 	)
+    # {
+    # 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+
+    # 	// Bring points to screen space
+    # 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+    # 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+    # 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+    # 	p_view = transformPoint4x3(p_orig, viewmatrix); // write this outside
+
+    # 	// if (idx % 32768 == 0) printf("Viewspace point: %f, %f, %f\n", p_view.x, p_view.y, p_view.z);
+    # 	// if (idx % 32768 == 0) printf("Projected point: %f, %f, %f\n", p_proj.x, p_proj.y, p_proj.z);
+    # 	return (p_proj.z > -1 - padding) && (p_proj.z < 1 + padding) && (p_proj.x > -1 - padding) && (p_proj.x < 1. + padding) && (p_proj.y > -1 - padding) && (p_proj.y < 1. + padding);
+    # }
+
+    # xyz: N, 3
+    # ndc = (xyz @ R.mT + T)[..., :3] @ K # N, 3
+    # ndc[..., :2] = ndc[..., :2] / ndc[..., 2:] / torch.as_tensor([W, H], device=ndc.device) # N, 2, normalized x and y
+    ndc = point_padding(xyz) @ full_proj_matrix
+    ndc = ndc[..., :3] / ndc[..., 3:]
+    return (ndc[..., 2] > -1 - padding) & (ndc[..., 2] < 1 + padding) & (ndc[..., 0] > -1 - padding) & (ndc[..., 0] < 1. + padding) & (ndc[..., 1] > -1 - padding) & (ndc[..., 1] < 1. + padding)  # N,
+
+
+@torch.jit.script
+def rgb2sh0(rgb: torch.Tensor):
+    C0 = 0.28209479177387814
+    return (rgb - 0.5) / C0
+
+
+@torch.jit.script
+def sh02rgb(sh: torch.Tensor):
+    C0 = 0.28209479177387814
+    return sh * C0 + 0.5
 
 
 @torch.jit.script
@@ -49,18 +94,6 @@ def gaussian_3d(scale3: torch.Tensor,  # B, P, 3, the scale of the 3d gaussian i
     R_sigma = rotmat @ sigma0
     covariance = R @ R_sigma @ R_sigma.mT @ R.mT
     return covariance  # B, P, 3, 3
-
-
-@torch.jit.script
-def RGB2SH(rgb):
-    C0 = 0.28209479177387814
-    return (rgb - 0.5) / C0
-
-
-@torch.jit.script
-def SH2RGB(sh):
-    C0 = 0.28209479177387814
-    return sh * C0 + 0.5
 
 
 @torch.jit.script
@@ -198,7 +231,8 @@ def prepare_gaussian_camera(batch):
 def convert_to_gaussian_camera(K: torch.Tensor,
                                R: torch.Tensor,
                                T: torch.Tensor,
-                               H: int, W: int,
+                               H: int,
+                               W: int,
                                znear: float = 0.01,
                                zfar: float = 100.
                                ):
@@ -219,7 +253,7 @@ def convert_to_gaussian_camera(K: torch.Tensor,
 
     output.world_view_transform = getWorld2View(output.R, output.T).transpose(0, 1)
     output.projection_matrix = getProjectionMatrix(output.K, output.image_height, output.image_width, znear, zfar).transpose(0, 1)
-    output.full_proj_transform = torch.matmul(output.world_view_transform, output.projection_matrix)
+    output.full_proj_transform = torch.matmul(output.world_view_transform, output.projection_matrix)  # 4, 4
     output.camera_center = output.world_view_transform.inverse()[3:, :3]
 
     # Set up rasterization configuration
@@ -234,6 +268,7 @@ class GaussianModel(nn.Module):
                  xyz: torch.Tensor = None,
                  colors: torch.Tensor = None,
                  init_occ: float = 0.1,
+                 init_scale: torch.Tensor = None,
                  sh_deg: int = 3,
                  scale_min: float = 1e-4,
                  scale_max: float = 1e1,
@@ -255,7 +290,7 @@ class GaussianModel(nn.Module):
         self.max_sh_degree = sh_deg
 
         # Initalize trainable parameters
-        self.create_from_pcd(xyz, colors, init_occ)
+        self.create_from_pcd(xyz, colors, init_occ, init_scale)
 
         # Densification related parameters
         self.max_radii2D = make_buffer(torch.zeros(self.get_xyz.shape[0]))
@@ -283,7 +318,7 @@ class GaussianModel(nn.Module):
         self.rotation_activation = getattr(torch, rotation_activation) if isinstance(rotation_activation, str) else rotation_activation
 
         self.scaling_inverse_activation = getattr(torch, scaling_inverse_activation) if isinstance(scaling_inverse_activation, str) else scaling_inverse_activation
-        self.inverse_opacity_activation = getattr(torch, inverse_opacity_activation) if isinstance(inverse_opacity_activation, str) else inverse_opacity_activation
+        self.opacity_inverse_activation = getattr(torch, inverse_opacity_activation) if isinstance(inverse_opacity_activation, str) else inverse_opacity_activation
         self.covariance_activation = build_covariance_from_scaling_rotation
 
     @property
@@ -319,23 +354,29 @@ class GaussianModel(nn.Module):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, xyz: torch.Tensor, colors: torch.Tensor, opacity: float = 0.1):
+    def create_from_pcd(self, xyz: torch.Tensor, colors: torch.Tensor = None, opacities: float = 0.1, scales: torch.Tensor = None):
         from simple_knn._C import distCUDA2
         if xyz is None:
             xyz = torch.empty(0, 3, device='cuda')  # by default, init empty gaussian model on CUDA
 
         features = torch.zeros((xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2))
         if colors is not None:
-            SH = RGB2SH(colors)
+            SH = rgb2sh0(colors)
             features[:, :3, 0] = SH
         features[:, 3: 1:] = 0
 
-        dist2 = torch.clamp_min(distCUDA2(xyz.float().cuda()), 0.0000001)
-        scales = self.scaling_inverse_activation(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        if scales is None:
+            dist2 = torch.clamp_min(distCUDA2(xyz.float().cuda()), 0.0000001)
+            scales = self.scaling_inverse_activation(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        else:
+            scales = self.scaling_inverse_activation(scales)
+
         rots = torch.rand((xyz.shape[0], 4))
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(opacity * torch.ones((xyz.shape[0], 1), dtype=torch.float))
+        if not isinstance(opacities, torch.Tensor) or len(opacities) != len(xyz):
+            opacities = opacities * torch.ones((xyz.shape[0], 1), dtype=torch.float)
+        opacities = self.opacity_inverse_activation(opacities)
 
         self._xyz = make_params(xyz)
         self._features_dc = make_params(features[:, :, :1].transpose(1, 2).contiguous())
@@ -347,9 +388,10 @@ class GaussianModel(nn.Module):
     @torch.no_grad()
     def _load_state_dict_pre_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         # Supports loading points and features with different shapes
-        if prefix is not '': prefix = prefix + '.' # special care for when we're loading the model directly
+        if prefix is not '' and not prefix.endswith('.'): prefix = prefix + '.'  # special care for when we're loading the model directly
         for name, params in self.named_parameters():
-            params.data = params.data.new_empty(state_dict[f'{prefix}{name}'].shape)
+            if f'{prefix}{name}' in state_dict:
+                params.data = params.data.new_empty(state_dict[f'{prefix}{name}'].shape)
 
     def reset_opacity(self, optimizer_state):
         for _, val in optimizer_state.items():
@@ -584,17 +626,31 @@ class GaussianModel(nn.Module):
         return l
 
     def save_ply(self, path):
-        import os
         from plyfile import PlyData, PlyElement
-        dirname = os.path.dirname(path)
-        os.makedirs(dirname, exist_ok=True)
+        os.makedirs(dirname(path), exist_ok=True)
+
+        # The original gaussian model uses a different activation
+        # Normalization for rotation, so no conversion
+        # Exp on scaling, need to -> world space -> log
+
+        # Doing inverse_sigmoid here will lead to NaNs
+        opacity = self._opacity
+        if self.opacity_activation != F.sigmoid and \
+                self.opacity_activation != torch.sigmoid and \
+                not isinstance(self.opacity_activation, nn.Sigmoid):
+            opacity = self.opacity_activation(opacity)
+            _opacity = inverse_sigmoid(opacity)
+
+        scale = self._scale
+        scale = self.scaling_activation(scale)
+        _scale = torch.log(scale)
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
+        opacities = _opacity.detach().cpu().numpy()
+        scale = _scale.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
@@ -604,6 +660,50 @@ class GaussianModel(nn.Module):
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
+    def load_ply(self, path: str):
+        xyz, _, _, scalars = load_pts(path)
+
+        # The original gaussian model uses a different activation
+        xyz = torch.from_numpy(xyz)
+        rotation = torch.from_numpy(np.concatenate([scalars['rot_{}'.format(i)] for i in range(4)], axis=-1))
+        scaling = torch.from_numpy(np.concatenate([scalars['scale_{}'.format(i)] for i in range(3)], axis=-1))
+        scaling = torch.exp(scaling)
+        scaling = self.scaling_inverse_activation(scaling)
+        opacity = torch.from_numpy(scalars['opacity'])
+
+        # Doing inverse_sigmoid here will lead to NaNs
+        if self.opacity_activation != F.sigmoid and \
+                self.opacity_activation != torch.sigmoid and \
+                not isinstance(self.opacity_activation, nn.Sigmoid):
+            opacity = inverse_sigmoid(opacity)
+            opacity = self.opacity_inverse_activation(opacity)
+
+        # Load the SH colors
+        features_dc = torch.empty((xyz.shape[0], 3, 1))
+        features_dc[:, 0] = torch.from_numpy(np.asarray(scalars["f_dc_0"]))
+        features_dc[:, 1] = torch.from_numpy(np.asarray(scalars["f_dc_1"]))
+        features_dc[:, 2] = torch.from_numpy(np.asarray(scalars["f_dc_2"]))
+
+        extra_f_names = [k for k in scalars.keys() if k.startswith("f_rest_")]
+        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split('_')[-1]))
+        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+        features_rest = torch.zeros((xyz.shape[0], len(extra_f_names), 1))
+        for idx, attr_name in enumerate(extra_f_names):
+            features_rest[:, idx] = torch.from_numpy(np.asarray(scalars[attr_name]))
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_rest = features_rest.view(features_rest.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
+
+        state_dict = dotdict()
+        state_dict._xyz = xyz
+        state_dict._features_dc = features_dc.mT
+        state_dict._features_rest = features_rest.mT
+        state_dict._opacity = opacity
+        state_dict._scaling = scaling
+        state_dict._rotation = rotation
+
+        self.load_state_dict(state_dict, strict=False)
+        self.active_sh_degree.data.fill_(self.max_sh_degree)
 
     def render(self, batch: dotdict):
         # TODO: Make rendering function easier to read, now there're at least 3 types of gaussian rendering function
@@ -617,7 +717,10 @@ class GaussianModel(nn.Module):
         sh = self.get_features
 
         # Prepare the camera transformation for Gaussian
-        gaussian_camera = to_x(prepare_gaussian_camera(add_batch(batch)), torch.float)
+        gaussian_camera = to_x(prepare_gaussian_camera(batch), torch.float)
+
+        # is_in_frustrum = in_frustrum(xyz, gaussian_camera.full_proj_transform)
+        # print('Number of points to render:', is_in_frustrum.sum().item())
 
         # Prepare rasterization settings for gaussian
         raster_settings = GaussianRasterizationSettings(

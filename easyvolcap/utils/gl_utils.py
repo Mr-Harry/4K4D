@@ -2,8 +2,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from easyvolcap.utils.egl_utils import create_opengl_context, eglContextManager  # must be imported before OpenGL.GL
+    from easyvolcap.runners.volumetric_video_viewer import VolumetricVideoViewer
 
 import os
+import sys
 import glm
 import torch
 import ctypes
@@ -11,33 +13,49 @@ import numpy as np
 
 from torch import nn
 from enum import Enum, auto
-from os.path import join, dirname
+from types import MethodType
 from typing import Dict, Union, List
 from glm import vec2, vec3, vec4, mat3, mat4, mat4x3, mat2x3  # This is actually highly optimized
 
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.base_utils import dotdict
 from easyvolcap.utils.viewer_utils import Camera
+from easyvolcap.utils.bound_utils import get_bounds
+from easyvolcap.utils.chunk_utils import multi_gather
 from easyvolcap.utils.color_utils import cm_cpu_store
+from easyvolcap.utils.ray_utils import create_meshgrid
 from easyvolcap.utils.depth_utils import depth_curve_fn
-from easyvolcap.utils.data_utils import load_pts, load_mesh, to_cuda
+from easyvolcap.utils.gaussian_utils import rgb2sh0, sh02rgb
+from easyvolcap.utils.nerf_utils import volume_rendering, raw2alpha
+from easyvolcap.utils.data_utils import load_pts, load_mesh, to_cuda, add_batch
+from easyvolcap.utils.cuda_utils import CHECK_CUDART_ERROR, FORMAT_CUDART_ERROR
+from easyvolcap.utils.net_utils import typed, torch_dtype_to_numpy_dtype, load_pretrained
 from easyvolcap.utils.fcds_utils import prepare_feedback_transform, get_opencv_camera_params
-from easyvolcap.utils.net_utils import typed, multi_gather, create_meshgrid, volume_rendering, raw2alpha, torch_dtype_to_numpy_dtype, load_pretrained, get_bounds
-from easyvolcap.utils.net_utils import CHECK_CUDART_ERROR, FORMAT_CUDART_ERROR
+
 
 # fmt: off
 # Environment variable messaging
 # Need to export EGL_DEVICE_ID before trying to import egl
 # And we need to consider the case when we're performing distributed training
 # from easyvolcap.engine import cfg, args  # FIXME: GLOBAL IMPORTS
-import sys
-if 'easyvolcap.engine' in sys.modules and (sys.modules['easyvolcap.engine'].args.type != 'gui' or sys.modules['easyvolcap.engine'].cfg.viewer_cfg.type == 'UnitySocketViewer'): # FIXME: GLOBAL VARIABLES
+if 'easyvolcap.engine' in sys.modules and \
+    (sys.modules['easyvolcap.engine'].args.type != 'gui' or \
+        sys.modules['easyvolcap.engine'].cfg.viewer_cfg.type != 'VolumetricVideoViewer'): # FIXME: GLOBAL VARIABLES
     try:
         from easyvolcap.utils.egl_utils import create_opengl_context, eglContextManager
     except Exception as e:
         log(yellow(f'Could not import EGL related modules. {type(e).__name__}: {e}'))
         os.environ['PYOPENGL_PLATFORM'] = ''
+
+def is_wsl2():
+    """Returns True if the current environment is WSL2, False otherwise."""
+    return exists("/etc/wsl.conf") and os.environ.get("WSL_DISTRO_NAME")
+
+if is_wsl2():
+    os.environ['PYOPENGL_PLATFORM'] = 'glx'
+
 import OpenGL.GL as gl
+
 try:
     from OpenGL.GL import shaders
 except Exception as e:
@@ -62,7 +80,9 @@ def common_opengl_options():
     gl.glCullFace(gl.GL_BACK)
 
     # Performs alpha trans testing
-    gl.glEnable(gl.GL_ALPHA_TEST)
+    # gl.glEnable(gl.GL_ALPHA_TEST)
+    try: gl.glEnable(gl.GL_ALPHA_TEST)
+    except gl.GLError as e: pass
 
     # Performs z-buffer testing
     gl.glEnable(gl.GL_DEPTH_TEST)
@@ -76,7 +96,9 @@ def common_opengl_options():
 
     # Enable this to correctly render points
     # https://community.khronos.org/t/gl-point-sprite-gone-in-3-2/59310
-    gl.glEnable(gl.GL_POINT_SPRITE)  # MARK: ONLY SPRITE IS WORKING FOR NOW
+    # gl.glEnable(gl.GL_POINT_SPRITE)  # MARK: ONLY SPRITE IS WORKING FOR NOW
+    try: gl.glEnable(gl.GL_POINT_SPRITE)  # MARK: ONLY SPRITE IS WORKING FOR NOW
+    except gl.GLError as e: pass
     # gl.glEnable(gl.GL_POINT_SMOOTH) # MARK: ONLY SPRITE IS WORKING FOR NOW
 
     # # Configure how we store the pixels in memory for our subsequent reading of the FBO to store the rendering into memory.
@@ -412,15 +434,72 @@ class Mesh:
             gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, n_faces_bytes, ctypes.c_void_p(0), gl.GL_DYNAMIC_DRAW)
             gl.glBindVertexArray(0)
 
-    def render_imgui(self):
-        pass
+    def render_imgui(mesh, viewer: 'VolumetricVideoViewer', batch: dotdict):
+        from imgui_bundle import imgui
+        from easyvolcap.utils.imgui_utils import push_button_color, pop_button_color
+
+        i = batch.i
+        will_delete = batch.will_delete
+        slider_width = batch.slider_width
+
+        imgui.push_item_width(slider_width * 0.5)
+        mesh.name = imgui.input_text(f'Mesh name##{i}', mesh.name)[1]
+
+        if imgui.begin_combo(f'Mesh type##{i}', mesh.render_type.name):
+            for t in Mesh.RenderType:
+                if imgui.selectable(t.name, mesh.render_type == t)[1]:
+                    mesh.render_type = t  # construct enum from name
+                if mesh.render_type == t:
+                    imgui.set_item_default_focus()
+            imgui.end_combo()
+        imgui.pop_item_width()
+
+        if hasattr(mesh, 'point_radius'):
+            mesh.point_radius = imgui.slider_float(f'Point radius##{i}', mesh.point_radius, 0.0005, 3.0)[1]  # 0.1mm
+
+        if hasattr(mesh, 'pts_per_pix'):
+            mesh.pts_per_pix = imgui.slider_int('Point per pixel', mesh.pts_per_pix, 0, 60)[1]  # 0.1mm
+
+        if hasattr(mesh, 'shade_flat'):
+            push_button_color(0x55cc33ff if not mesh.shade_flat else 0x8855aaff)
+            if imgui.button(f'Smooth##{i}' if not mesh.shade_flat else f' Flat ##{i}'):
+                mesh.shade_flat = not mesh.shade_flat
+            pop_button_color()
+
+        if hasattr(mesh, 'render_normal'):
+            imgui.same_line()
+            push_button_color(0x55cc33ff if not mesh.render_normal else 0x8855aaff)
+            if imgui.button(f'Color ##{i}' if not mesh.render_normal else f'Normal##{i}'):
+                mesh.render_normal = not mesh.render_normal
+            pop_button_color()
+
+        if hasattr(mesh, 'visible'):
+            imgui.same_line()
+            push_button_color(0x55cc33ff if not mesh.visible else 0x8855aaff)
+            if imgui.button(f'Show##{i}' if not mesh.visible else f'Hide##{i}'):
+                mesh.visible = not mesh.visible
+            pop_button_color()
+
+        # Render the delete button
+        imgui.same_line()
+        push_button_color(0xff5533ff)
+        if imgui.button(f'Delete##{i}'):
+            will_delete.append(i)
+        pop_button_color()
 
 
 class Quad(Mesh):
     # A shared texture for CUDA (pytorch) and OpenGL
     # Could be rendererd to screen using blitting or just drawing a quad
-    def __init__(self, H: int = 256, W: int = 256, use_cudagl: bool = True, compose: bool = False, compose_power: float = 1.0):  # the texture to blip
-        self.use_cudagl = use_cudagl
+    def __init__(self,
+                 H: int = 256, W: int = 256,
+                 use_quad_draw: bool = True,
+                 use_quad_cuda: bool = True,
+                 compose: bool = False,
+                 compose_power: float = 1.0,
+                 ):  # the texture to blip
+        self.use_quad_draw = use_quad_draw
+        self.use_quad_cuda = use_quad_cuda
         self.vert_sizes = [3]  # only position
         self.vert_gl_types = [gl.GL_FLOAT]  # only position
         self.render_type = Mesh.RenderType.STRIPS  # remove side effects of settings _type
@@ -436,6 +515,7 @@ class Quad(Mesh):
         self.H, self.W = H, W
         self.compose = compose
         self.compose_power = compose_power
+
         self.init_texture()
 
     @property
@@ -486,19 +566,32 @@ class Quad(Mesh):
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self.tex, 0)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, old_fbo)
 
-        if self.use_cudagl:
+        if self.use_quad_cuda:
             from cuda import cudart
             if self.compose:
                 # Both reading and writing of this resource is required
                 flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsNone
             else:
                 flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
-            self.cu_tex = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterImage(self.tex, gl.GL_TEXTURE_2D, flags))
+            try:
+                self.cu_tex = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterImage(self.tex, gl.GL_TEXTURE_2D, flags))
+            except RuntimeError as e:
+                log(red('Failed to initialize Quad with CUDA-GL interop, will use slow upload: '), e)
+                self.use_quad_cuda = False
 
     def copy_to_texture(self, image: torch.Tensor, x: int = 0, y: int = 0, w: int = 0, h: int = 0):
-        assert self.use_cudagl, "Need to enable cuda-opengl interop to copy from device to device, check creation of this Quad"
+        if not self.use_quad_cuda:
+            self.upload_to_texture(image)
+            return
+
+        if not hasattr(self, 'cu_tex'):
+            self.init_texture()
+
+        # assert self.use_quad_cuda, "Need to enable cuda-opengl interop to copy from device to device, check creation of this Quad"
         w = w or self.W
         h = h or self.H
+        if image.shape[-1] == 3:
+            image = torch.cat([image, image.new_ones(image.shape[:-1] + (1,)) * 255], dim=-1)  # add alpha channel
 
         from cuda import cudart
         kind = cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
@@ -547,11 +640,14 @@ class Quad(Mesh):
                                                            torch.cuda.current_stream().cuda_stream))
         CHECK_CUDART_ERROR(cudart.cudaGraphicsUnmapResources(1, self.cu_tex, torch.cuda.current_stream().cuda_stream))
 
-    def upload_to_texture(self, ptr: np.ndarray):
-        H, W = ptr.shape[:2]
-        H, W = min(self.H, H), min(self.W, W)
+    def upload_to_texture(self, ptr: np.ndarray, x: int = 0, y: int = 0, w: int = 0, h: int = 0):
+        w = w or self.W
+        h = h or self.H
+        if isinstance(ptr, torch.Tensor):
+            ptr = ptr.detach().cpu().numpy()  # slow sync and copy operation # MARK: SYNC
+
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
-        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, W, H, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ptr[:H, :W])  # to gpu, might slow down?
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, x, y, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ptr[y:h, x:w])  # to gpu, might slow down?
 
     @property
     def verts_data(self):  # a heavy copy operation
@@ -567,6 +663,10 @@ class Quad(Mesh):
         Upload the texture instead of the camera
         This respects the OpenGL convension of lower left corners
         """
+        if not self.use_quad_draw:
+            self.blit(x, y, w, h)
+            return
+
         w = w or self.W
         h = h or self.H
         _, _, W, H = gl.glGetIntegerv(gl.GL_VIEWPORT)
@@ -676,10 +776,14 @@ class UQuad(Mesh):
 
 class DQuad(UQuad):
     def compile_shaders(self):
-        self.quad_program = shaders.compileProgram(
-            shaders.compileShader(load_shader_source('dquad.vert'), gl.GL_VERTEX_SHADER),
-            shaders.compileShader(load_shader_source('dquad.frag'), gl.GL_FRAGMENT_SHADER)
-        )
+        try:
+            self.quad_program = shaders.compileProgram(
+                shaders.compileShader(load_shader_source('dquad.vert'), gl.GL_VERTEX_SHADER),
+                shaders.compileShader(load_shader_source('dquad.frag'), gl.GL_FRAGMENT_SHADER)
+            )
+        except Exception as e:
+            print(str(e).encode('utf-8').decode('unicode_escape'))
+            raise e
 
     def draw(self, values: List[List[float]] = [], use_texs=[]):
         old_function = gl.glGetIntegerv(gl.GL_DEPTH_FUNC)
@@ -786,7 +890,7 @@ class Gaussian(Mesh):
                  gaussian_cfg: dotdict = dotdict(),
                  quad_cfg: dotdict = dotdict(),
 
-                 render_depth: bool = False,  # show depth or show color
+                 view_depth: bool = False,  # show depth or show color
                  dpt_cm: str = 'linear',
 
                  H: int = 1024,
@@ -818,7 +922,10 @@ class Gaussian(Mesh):
 
         elif filename.endswith('.ply'):
             # Load raw GaussianModel
-            pass
+            # pts, rgb, norm, scalars = load_pts(filename)
+            self.gaussian_model: GaussianModel = call_from_cfg(GaussianModel, gaussian_cfg)  # init empty gaussian model
+            self.gaussian_model.load_ply(filename)  # load the original gaussian model
+            self.gaussian_model.cuda()
         else:
             raise NotImplementedError
 
@@ -826,8 +933,11 @@ class Gaussian(Mesh):
         self.quad: Quad = call_from_cfg(Quad, quad_cfg, H=H, W=W)
 
         # Other configurations
-        self.render_depth = render_depth
+        self.view_depth = view_depth
         self.dpt_cm = dpt_cm
+        del self.shade_flat
+        del self.point_radius
+        del self.render_normal
 
     # Disabling initialization
     def load_from_file(self, *args, **kwargs):
@@ -849,10 +959,89 @@ class Gaussian(Mesh):
     @torch.no_grad()
     def render(self, camera: Camera):
         # Perform actual gaussian rendering
-        batch = to_cuda(camera.to_batch())
+        batch = add_batch(to_cuda(camera.to_batch()))
         rgb, acc, dpt = self.gaussian_model.render(batch)
 
-        if self.render_depth:
+        if self.view_depth:
+            rgba = torch.cat([depth_curve_fn(dpt, cm=self.dpt_cm), acc], dim=-1)  # H, W, 4
+        else:
+            rgba = torch.cat([rgb, acc], dim=-1)  # H, W, 4
+
+        # Copy rendered tensor to screen
+        rgba = (rgba.clip(0, 1) * 255).type(torch.uint8).flip(0)  # transform
+        self.quad.copy_to_texture(rgba)
+        self.quad.draw()
+
+    def render_imgui(mesh, viewer: 'VolumetricVideoViewer', batch: dotdict):
+        super().render_imgui(viewer, batch)
+
+        from imgui_bundle import imgui
+        from easyvolcap.utils.imgui_utils import push_button_color, pop_button_color
+
+        i = batch.i
+        imgui.same_line()
+        push_button_color(0x55cc33ff if not mesh.view_depth else 0x8855aaff)
+        if imgui.button(f'Color##{i}' if not mesh.view_depth else f' Depth ##{i}'):
+            mesh.view_depth = not mesh.view_depth
+        pop_button_color()
+
+
+class PointSplat(Gaussian):
+    def __init__(self,
+                 filename: str = 'assets/meshes/zju3dv.ply',
+
+                 quad_cfg: dotdict = dotdict(),
+
+                 view_depth: bool = False,  # show depth or show color
+                 dpt_cm: str = 'linear',
+
+                 H: int = 1024,
+                 W: int = 1024,
+                 **kwargs,
+                 ):
+        # Import Gaussian Model
+        from easyvolcap.engine.registry import call_from_cfg
+        from easyvolcap.utils.data_utils import load_pts
+        from easyvolcap.utils.net_utils import make_buffer
+        from easyvolcap.models.samplers.gaussiant_sampler import GaussianTSampler
+
+        # Housekeeping
+        super(Gaussian, self).__init__(**kwargs)
+        self.name = split(filename)[-1]
+        self.render_radius = MethodType(GaussianTSampler.render_radius, self)  # override the method
+
+        # Init PointSplat related models, for now only the first gaussian model is supported
+        if filename.endswith('.ply'):
+            # Load raw GaussianModel
+            pts, rgb, norms, scalars = load_pts(filename)
+            occ, rad = scalars.alpha, scalars.radius
+            self.pts = make_buffer(torch.from_numpy(pts))  # N, 3
+            self.rgb = make_buffer(torch.from_numpy(rgb))  # N, 3
+            self.occ = make_buffer(torch.from_numpy(occ))  # N, 1
+            self.rad = make_buffer(torch.from_numpy(rad))  # N, 1
+        else:
+            raise NotImplementedError
+
+        # Init rendering quad
+        self.quad: Quad = call_from_cfg(Quad, quad_cfg, H=H, W=W)
+
+        # Other configurations
+        self.view_depth = view_depth
+        self.dpt_cm = dpt_cm
+
+    # The actual rendering function
+    @torch.no_grad()
+    def render(self, camera: Camera):
+        # Perform actual gaussian rendering
+        batch = add_batch(to_cuda(camera.to_batch()))
+        sh0 = rgb2sh0(self.rgb)
+        xyz = self.pts
+        occ = self.occ
+        rad = self.rad
+
+        rgb, acc, dpt = self.render_radius(*add_batch([xyz, sh0, rad, occ]), batch)
+
+        if self.view_depth:
             rgba = torch.cat([depth_curve_fn(dpt, cm=self.dpt_cm), acc], dim=-1)  # H, W, 4
         else:
             rgba = torch.cat([rgb, acc], dim=-1)  # H, W, 4
@@ -863,7 +1052,7 @@ class Gaussian(Mesh):
         self.quad.render()
 
 
-class Splat(Mesh):
+class Splat(Mesh):  # FIXME: Not rendering, need to debug this
     def __init__(self,
                  *args,
                  H: int = 512,
@@ -1084,10 +1273,10 @@ class HardwareRendering(Splat):
                  ):
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         self.gl_dtype = gl.GL_HALF_FLOAT if self.dtype == torch.half else gl.GL_FLOAT
-        super().__init__(**kwargs,
-                         blit_last_ratio=0.90,
-                         vert_sizes=[3, 3, 1, 1],
-                         )  # verts, color, radius, alpha
+        kwargs = dotdict(kwargs)
+        kwargs.blit_last_ratio = kwargs.get('blit_last_ratio', 0.90)
+        kwargs.vert_sizes = kwargs.get('vert_sizes', [3, 3, 1, 1])
+        super().__init__(**kwargs)  # verts, color, radius, alpha
 
     @property
     def verts_data(self):  # a heavy copy operation
@@ -1104,7 +1293,14 @@ class HardwareRendering(Splat):
 
         # Register vertex buffer obejct
         flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
-        self.cu_vbo = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterBuffer(self.vbo, flags))
+        try:
+            self.cu_vbo = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterBuffer(self.vbo, flags))
+        except RuntimeError as e:
+            log(red(f'Your system does not support CUDA-GL interop, please use pytorch3d\'s implementation instead'))
+            log(red(f'This can be done by specifying {blue("model_cfg.sampler_cfg.use_cudagl=False model_cfg.sampler_cfg.use_diffgl=False")} at the end of your command'))
+            log(red(f'Note that this implementation is extremely slow, we recommend running on a native system that support the interop'))
+            # raise RuntimeError(str(e) + ": This unrecoverable, please read the error message above")
+            raise e
 
     def init_textures(self):
         from cuda import cudart
@@ -1240,6 +1436,18 @@ class HardwarePeeling(Splat):
         verts = np.asarray(verts, dtype=torch_dtype_to_numpy_dtype(self.dtype), order='C')  # this should only be invoked once
         return verts
 
+    def init_gl_buffers(self, v: int = 0, f: int = 0):
+        from cuda import cudart
+        if hasattr(self, 'cu_vbo'):
+            CHECK_CUDART_ERROR(cudart.cudaGraphicsUnregisterResource(self.cu_vbo))
+
+        super().init_gl_buffers(v, f)
+
+        # Register vertex buffer obejct
+        flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
+        self.cu_vbo = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterBuffer(self.vbo, flags))\
+
+
     def use_gl_program(self, program):
         super().use_gl_program(program)
 
@@ -1259,22 +1467,8 @@ class HardwarePeeling(Splat):
                 shaders.compileShader(load_shader_source('idx_splat.frag'), gl.GL_FRAGMENT_SHADER)
             )
         except Exception as e:
-            try:
-                print(str(e).encode('utf-8').decode('unicode_escape'))
-            except Exception as e:
-                pass
+            print(str(e).encode('utf-8').decode('unicode_escape'))
             raise e
-
-    def init_gl_buffers(self, v: int = 0, f: int = 0):
-        from cuda import cudart
-        if hasattr(self, 'cu_vbo'):
-            CHECK_CUDART_ERROR(cudart.cudaGraphicsUnregisterResource(self.cu_vbo))
-
-        super().init_gl_buffers(v, f)
-
-        # Register vertex buffer obejct
-        flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
-        self.cu_vbo = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterBuffer(self.vbo, flags))
 
     def init_textures(self):
         from cuda import cudart

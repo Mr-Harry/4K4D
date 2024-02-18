@@ -17,11 +17,16 @@ from easyvolcap.engine import SAMPLERS, EMBEDDERS, REGRESSORS
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.timer_utils import timer
 from easyvolcap.utils.sh_utils import eval_sh
+from easyvolcap.utils.bound_utils import get_bounds
 from easyvolcap.utils.parallel_utils import parallel_execution
+from easyvolcap.utils.math_utils import affine_inverse, normalize
+from easyvolcap.utils.chunk_utils import multi_gather, multi_scatter
+from easyvolcap.utils.data_utils import to_cuda, to_tensor, add_batch
 from easyvolcap.utils.enerf_utils import sample_geometry_feature_image
 from easyvolcap.utils.ibr_utils import compute_src_feats, compute_src_inps
-from easyvolcap.utils.net_utils import unfreeze_module, freeze_module, normalize, typed, make_params, make_buffer, interpolate_image, affine_inverse, multi_gather, register_memory, unregister_memory, fill_nchw_image, get_bounds
-from easyvolcap.utils.data_utils import to_cuda, to_tensor, add_batch
+from easyvolcap.utils.cuda_utils import register_memory, unregister_memory
+from easyvolcap.utils.image_utils import interpolate_image, pad_image
+from easyvolcap.utils.net_utils import unfreeze_module, freeze_module, typed, make_params, make_buffer
 
 from easyvolcap.models.networks.embedders.kplanes_embedder import KPlanesEmbedder
 from easyvolcap.models.samplers.point_planes_sampler import PointPlanesSampler
@@ -62,7 +67,9 @@ def forward_for_xyz_feat(i: int, sampler: SuperChargedR4DV, b, e, s, tb, te, ts,
     xyz: torch.Tensor = sampler.pcds[(b + i * s) // ts - tb][None]
     t = times[(b + i * s) // ts - tb]
     xyz_t = t[None, None].expand(*xyz.shape[:-1], 1)  # B, N, 1
+    timer.record('post processing')
     xyz_feat: torch.Tensor = sampler.xyz_embedder(xyz, xyz_t)  # same time
+    timer.record('sampling 4D feature')
     return xyz, xyz_feat  # this is without batch dimension
 
 
@@ -118,8 +125,8 @@ def average_single_frame(i: int,
     timer.record('load cameras')
 
     # Load source images from the dataset
-    if dataset.closest_using_t: src_inps, _, _, _ = zip(*parallel_execution([i] * kwargs.n_srcs, src_inds, action=dataset.get_image))  # S: H, W, 3 # MARK: SYNC
-    else: src_inps, _, _, _ = zip(*parallel_execution(src_inds, [i] * kwargs.n_srcs, action=dataset.get_image))  # S: H, W, 3 # MARK: SYNC
+    if dataset.closest_using_t: src_inps = list(zip(*parallel_execution([i] * kwargs.n_srcs, src_inds, action=dataset.get_image)))[0]  # S: H, W, 3 # MARK: SYNC
+    else: src_inps = list(zip(*parallel_execution(src_inds, [i] * kwargs.n_srcs, action=dataset.get_image)))[0]  # S: H, W, 3 # MARK: SYNC
 
     # Move the source images to GPU and concatenate them (with black scaling)
     src_inps = [inp[None].permute(0, 3, 1, 2).to(xyz) for inp in src_inps]  # S: B, 3, H, W  # move to the same device
@@ -129,7 +136,7 @@ def average_single_frame(i: int,
     img_pad = sampler.ibr_embedder.feat_reg.size_pad
     Hc, Wc = src_inps.shape[-2:]  # padded and cropped image size
     Hp, Wp = int(np.ceil(Hc / img_pad)) * img_pad, int(np.ceil(Wc / img_pad)) * img_pad  # Input and output should be same in size
-    src_inps = fill_nchw_image(src_inps, size=(Hp, Wp))  # B, S, 3, H, W
+    src_inps = pad_image(src_inps, size=(Hp, Wp))  # B, S, 3, H, W
     timer.record('load source images')
 
     # Pass through the IBR networks for blending weights
@@ -137,7 +144,7 @@ def average_single_frame(i: int,
         inp,
         sampler.ibr_embedder.feat_reg
     )[-1] for inp in src_inps[0]])[None]  # B, S, 3, H, W
-    timer.record('compute features')
+    timer.record('image feature extraction')
 
     src_feat_inps = torch.cat([
         src_feat,
@@ -145,16 +152,16 @@ def average_single_frame(i: int,
     ], dim=-3)  # B, S, C, H, W
 
     # Compute projected color of every image, using the original size image
-    ibrs_rgbs = sample_geometry_feature_image(
+    ibrs_rgbs = torch.cat([sample_geometry_feature_image(
         xyz,
-        src_feat_inps,
-        src_exts,
-        src_ixts,
+        src_feat_inps[:, i:i + 1],
+        src_exts[:, i:i + 1],
+        src_ixts[:, i:i + 1],
         src_inps.new_ones(2, 1),
-    )  # B, S, N, 3
+    ) for i in range(src_feat_inps.shape[1])], dim=1)  # B, S, N, 3
     ibrs, rgbs = ibrs_rgbs[..., :-3], ibrs_rgbs[..., -3:]
     del src_feat, src_inps, src_feat_inps, ibrs_rgbs
-    timer.record('sample features')
+    timer.record('sample image features')
 
     exp_xyz_feat = xyz_feat[..., None, :, :].expand(ibrs.shape[:-1] + (xyz_feat.shape[-1],))
     xyz_ibr_rgbs = torch.cat([exp_xyz_feat, ibrs, rgbs], dim=-1)  # B, S, N, 43
@@ -226,11 +233,10 @@ class SuperChargedR4DV(PointPlanesSampler):
         self.cache_size = cache_size
         self.retain_resd = retain_resd
         self.should_release_memory = should_release_memory
-        self.sh_deg = self.ibr_regressor.sh_deg
-        self.sh_dim = self.ibr_regressor.sh_dim
-        self.out_dim = self.ibr_regressor.out_dim
-        self.resd_limit = self.ibr_regressor.resd_limit
-
+        self.ibr_sh_deg = self.ibr_regressor.sh_deg
+        self.ibr_sh_dim = self.ibr_regressor.sh_dim
+        self.ibr_out_dim = self.ibr_regressor.out_dim
+        self.ibr_resd_limit = self.ibr_regressor.resd_limit
         if not retain_resd:
             del self.pcd_embedder
             del self.resd_regressor
@@ -388,8 +394,10 @@ class SuperChargedR4DV(PointPlanesSampler):
         if hasattr(self, 'ibr_regressor') and hasattr(self.ibr_regressor, 'sh_mlp'):
             self.shs = [None for _ in self.pcds]  # BIG
             for i, feat in enumerate(tqdm(feats, desc='Caching spherical harmonics')):
+                timer.record('sh overhead')
                 sh: torch.Tensor = self.ibr_regressor.sh_mlp(feat)
-                sh = sh.view(*sh.shape[:-1], self.out_dim, self.sh_dim // self.out_dim)[..., :(self.n_shs + 1) ** 2]  # reshape to B, P, 3, SH
+                timer.record('sh regression')
+                sh = sh.view(*sh.shape[:-1], self.ibr_out_dim, self.ibr_sh_dim // self.ibr_out_dim)[..., :(self.n_shs + 1) ** 2]  # reshape to B, P, 3, SH
                 sh = sh.to(self.dtype).view(self.memory_dtype).detach().cpu(memory_format=torch.contiguous_format)  # MARK: SYNC
                 torch.cuda.empty_cache()  # only out-of-frame cache cleaning works
                 sh = register_memory(sh)  # only registering using cudart
@@ -414,7 +422,9 @@ class SuperChargedR4DV(PointPlanesSampler):
         self.rads = nn.ParameterList([None for _ in self.pcds])  # OK
         self.occs = nn.ParameterList([None for _ in self.pcds])  # OK
         for i, feat in enumerate(tqdm(feats, desc='Caching radius and alpha')):
+            timer.record('geometry overhead')
             rad, occ = self.geo_regressor(feat)
+            timer.record('geometry regression')
             self.rads[(b + i * s) // ts - tb] = make_buffer(rad)
             self.occs[(b + i * s) // ts - tb] = make_buffer(occ)
 
@@ -467,7 +477,7 @@ class SuperChargedR4DV(PointPlanesSampler):
         inds = inds[..., None, None].expand((-1, -1) + rgbw.shape[-2:])  # B, 4, N, 4
         rgbw = rgbw.gather(-3, inds)  # B, 4, N, 4
         base = (rgbw[..., -1:].softmax(-3) * rgbw[..., :-1]).sum(-3)
-
+        
         # Residual speculars
         rgb = base + eval_sh(sh_deg, sh, dir).tanh() * resd_limit  # NOTE: this is the only thing that need to be run on CUDA (or torch)
         rgb = rgb.clip(0, 1)
@@ -492,13 +502,17 @@ class SuperChargedR4DV(PointPlanesSampler):
         if self.skip_base:
             sh = sh.abs()
             rgbw[..., :3] = 0
-        rgb = self.get_rgb(batch.R.half(), batch.T.half(), xyz, sh, rgbw, cent, self.n_srcs, self.n_shs, self.resd_limit)
+        timer.record('sample source images')
+
+        rgb = self.get_rgb(batch.R.half(), batch.T.half(), xyz, sh, rgbw, cent, self.n_srcs, self.n_shs, self.ibr_resd_limit)
+        timer.record('evaluate SH')
 
         if return_frags:
             return None, xyz, rgb, rad, occ
 
         # Perform points rendering (for now, this is dominating)
         rgb, acc, dpt = self.render_points(xyz, rgb, rad, occ, batch)  # almost always use render_cudagl
+        timer.record('render points')
 
         # Prepare for output
         self.store_output(None, xyz, rgb, acc, dpt, batch)

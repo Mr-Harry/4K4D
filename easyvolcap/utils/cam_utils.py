@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import cv2
 import json
+import torch
 import numpy as np
 from typing import Union
 from enum import Enum, auto
@@ -11,6 +12,24 @@ from scipy.spatial.transform import Rotation
 
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.data_utils import get_rays, get_near_far
+from easyvolcap.utils.math_utils import affine_inverse, affine_padding
+
+
+def compute_camera_similarity(tar_c2ws: torch.Tensor, src_c2ws: torch.Tensor):
+    # c2ws = affine_inverse(w2cs)  # N, L, 3, 4
+    # src_exts = affine_padding(w2cs)  # N, L, 4, 4
+
+    # tar_c2ws = c2ws
+    # src_c2ws = affine_inverse(src_exts)
+    centers_target = tar_c2ws[..., :3, 3]  # N, L, 3
+    centers_source = src_c2ws[..., :3, 3]  # N, L, 3
+
+    # Using distance between centers for camera selection
+    sims: torch.Tensor = 1 / (centers_source[None] - centers_target[:, None]).norm(dim=-1)  # N, N, L,
+
+    # Source view index and there similarity
+    src_sims, src_inds = sims.sort(dim=1, descending=True)  # similarity to source views # Target, Source, Latent
+    return src_sims, src_inds  # N, N, L
 
 
 class Interpolation(Enum):
@@ -67,7 +86,7 @@ def closest_point_2_lines(oa: np.ndarray, da: np.ndarray, ob: np.ndarray, db: np
 # From: https://github.com/sarafridov/K-Planes/blob/main/plenoxels/datasets/ray_utils.py
 
 
-def average_c2ws(c2ws: np.ndarray, align: bool = True) -> np.ndarray:
+def average_c2ws(c2ws: np.ndarray, align_cameras: bool = True, look_at_center: bool = True) -> np.ndarray:
     """
     Calculate the average pose, which is then used to center all poses
     using @center_poses. Its computation is as follows:
@@ -84,8 +103,8 @@ def average_c2ws(c2ws: np.ndarray, align: bool = True) -> np.ndarray:
         pose_avg: (3, 4) the average pose
     """
 
-    # 1. Compute the center
-    if align:
+    if align_cameras:
+        # 1. Compute the center
         center = compute_center_of_attention(c2ws)[..., 0]  # (3)
         # 2. Compute the z axis
         z = -normalize(c2ws[..., 1].mean(0))  # (3) # FIXME: WHY?
@@ -97,9 +116,14 @@ def average_c2ws(c2ws: np.ndarray, align: bool = True) -> np.ndarray:
         y = -np.cross(x, z)  # (3)
 
     else:
+        # 1. Compute the center
         center = c2ws[..., 3].mean(0)  # (3)
         # 2. Compute the z axis
-        z = normalize(c2ws[..., 2].mean(0))  # (3)
+        if look_at_center:
+            look = compute_center_of_attention(c2ws)[..., 0]  # (3)
+            z = normalize(look - center)
+        else:
+            z = normalize(c2ws[..., 2].mean(0))  # (3)
         # 3. Compute axis y' (no need to normalize as it's not the final output)
         y_ = c2ws[..., 1].mean(0)  # (3)
         # 4. Compute the x axis
@@ -328,7 +352,7 @@ def generate_spiral_path(c2ws: np.ndarray,
     c2ws = c2ws[..., :3, :4]
 
     # Center pose
-    c2w_avg = average_c2ws(c2ws, align=False)  # [3, 4]
+    c2w_avg = average_c2ws(c2ws, align_cameras=False, look_at_center=True)  # [3, 4]
 
     # Get average pose
     v_up = -normalize(c2ws[:, :3, 1].sum(0))
@@ -364,7 +388,7 @@ def generate_spiral_path(c2ws: np.ndarray,
 def generate_hemispherical_orbit(c2ws: np.ndarray,
                                  n_render_views=50,
                                  orbit_height=0.,
-                                 orbit_radius=None,
+                                 orbit_radius=-1,
                                  radius_ratio=1.0,
                                  **kwargs):
     """Calculates a render path which orbits around the z-axis.
@@ -376,7 +400,7 @@ def generate_hemispherical_orbit(c2ws: np.ndarray,
 
     # Find the origin and radius for the orbit
     origins = c2ws[:, :3, 3]
-    radius = (np.sqrt(np.mean(np.sum(origins ** 2, axis=-1))) * radius_ratio) if orbit_radius is None else orbit_radius
+    radius = (np.sqrt(np.mean(np.sum(origins ** 2, axis=-1))) * radius_ratio) if orbit_radius <= 0 else orbit_radius
 
     # Get average pose
     v_up = -normalize(c2ws[:, :3, 1].sum(0))

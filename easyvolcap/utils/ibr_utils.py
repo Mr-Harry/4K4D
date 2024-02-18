@@ -6,7 +6,7 @@ from functools import lru_cache
 from torchvision.io import decode_jpeg
 
 from easyvolcap.utils.base_utils import dotdict
-from easyvolcap.utils.net_utils import fill_nchw_image
+from easyvolcap.utils.image_utils import pad_image
 
 # How do we easily wraps all stuff in the lru?
 # Initialize the lru requires some change to global variables, better expose APIs
@@ -74,7 +74,7 @@ def get_src_feats(src_inps: torch.Tensor, feat_reg: nn.Module, batch: dotdict, k
     for i, v in enumerate(src_inds):
         g_src_inps.src_inp = src_inps[i]  # use full image for both foreground and background (layer enerf experience)
         fs = g_cached_feature(t.item(), v.item(), key)
-        fs = [fill_nchw_image(f, size=(h, w)) for h, w, f in zip(Hps, Wps, fs)]  # resizing to current input
+        fs = [pad_image(f, size=(h, w)) for h, w, f in zip(Hps, Wps, fs)]  # resizing to current input
         feats.append(fs)
     feats = [torch.stack([f[i] for f in feats])[None] for i in range(len(feat_reg.scales))]  # HACK: too hacky...
 
@@ -90,7 +90,7 @@ def compute_src_inps(batch: dotdict, key: str = 'src_inps'):
     # [Sampler] Decodes stored images (using torchvision api of nvjpeg), stack them together with zero padding -> images might be large
     # [Sampler] Forwards images to interpolation, pass through feature decoder -> feature might be large
 
-    # The `key` may be `src_inps` or `bg_src_inps` for enerf and layer enerf respectively
+    # The `key` may be `src_inps` or `src_bkgs` for enerf and layer enerf respectively
     if key not in batch and key in batch.meta and isinstance(batch.meta[key], list) and batch.meta[key][0].ndim == 2:
         # Perform decoding
         # The input tensor must be on CPU when decoding with nvjpeg
@@ -101,7 +101,7 @@ def compute_src_inps(batch: dotdict, key: str = 'src_inps'):
         # Perform reshaping
         max_h = max([i.shape[-2] for i in batch[key]])
         max_w = max([i.shape[-1] for i in batch[key]])
-        batch[key] = torch.stack([fill_nchw_image(img, [max_h, max_w]) for img in batch[key]]).permute(1, 0, 2, 3, 4)  # S: B, C, H, W -> B, S, C, H, W
+        batch[key] = torch.stack([pad_image(img, [max_h, max_w]) for img in batch[key]]).permute(1, 0, 2, 3, 4)  # S: B, C, H, W -> B, S, C, H, W
 
     return batch[key].contiguous()  # always return a contiguous tensor
 

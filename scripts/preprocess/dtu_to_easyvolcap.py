@@ -11,12 +11,12 @@ from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.base_utils import dotdict
 from easyvolcap.utils.easy_utils import write_camera
 from easyvolcap.utils.parallel_utils import parallel_execution
-from easyvolcap.utils.data_utils import read_cam_file, read_pfm
+from easyvolcap.utils.data_utils import read_cam_file, read_pfm, save_image
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dtu_root', type=str, default='data/dtu')
+    parser.add_argument('--dtu_root', type=str, default='/nas/home/xuzhen/datasets//dtu')
     parser.add_argument('--easyvolcap_root', type=str, default='data/dtu')
     parser.add_argument('--scale', type=float, default=200.0)  # rescale the cameras as in enerf
     args = parser.parse_args()
@@ -44,9 +44,11 @@ def main():
         # Treat them as one single camera's input
         img_out_dir = join(easyvolcap_root, scene, 'images', '00')
         msk_out_dir = join(easyvolcap_root, scene, 'masks', '00')
+        dpt_out_dir = join(easyvolcap_root, scene, 'depths', '00')
         cam_out_dir = join(easyvolcap_root, scene, 'cameras', '00')
         os.makedirs(img_out_dir, exist_ok=True)  # dtu/scanxxx
         os.makedirs(msk_out_dir, exist_ok=True)  # dtu/scanxxx
+        os.makedirs(dpt_out_dir, exist_ok=True)  # dtu/scanxxx
         os.makedirs(cam_out_dir, exist_ok=True)  # dtu/scanxxx
 
         # Store camera parameters
@@ -61,12 +63,15 @@ def main():
             dpt = read_pfm(dpt_path)[0].astype(np.float32) / scale
             msk = (dpt > 0.).astype(np.uint8)
             msk = cv2.resize(msk, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_NEAREST)[44:-44, 80:-80]
+            dpt = cv2.resize(dpt, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)[44:-44, 80:-80]
 
             # Writing and linking
             img_out_path = join(img_out_dir, f'{i:06d}.jpg')
-            cv2.imwrite(img_out_path, cv2.imread(img_path), [cv2.IMWRITE_JPEG_QUALITY, 100])  # highest quality
+            save_image(img_out_path, cv2.imread(img_path), jpeg_quality=100)  # highest quality compression
             msk_out_path = join(msk_out_dir, f'{i:06d}.jpg')
-            cv2.imwrite(msk_out_path, msk * 255)
+            save_image(msk_out_path, msk * 255)
+            dpt_out_path = join(dpt_out_dir, f'{i:06d}.exr')
+            save_image(dpt_out_path, dpt)
 
         parallel_execution(list(range(num_cams)), action=process_image)
 

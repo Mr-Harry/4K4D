@@ -1,3 +1,49 @@
+# fmt: off
+class Colors:
+    """ ANSI color codes """
+    BLACK = "\033[0;30m"
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    BROWN = "\033[0;33m"
+    BLUE = "\033[0;34m"
+    PURPLE = "\033[0;35m"
+    CYAN = "\033[0;36m"
+    LIGHT_GRAY = "\033[0;37m"
+    DARK_GRAY = "\033[1;30m"
+    LIGHT_RED = "\033[1;31m"
+    LIGHT_GREEN = "\033[1;32m"
+    YELLOW = "\033[1;33m"
+    LIGHT_BLUE = "\033[1;34m"
+    LIGHT_PURPLE = "\033[1;35m"
+    LIGHT_CYAN = "\033[1;36m"
+    LIGHT_WHITE = "\033[1;37m"
+    BOLD = "\033[1m"
+    FAINT = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    BLINK = "\033[5m"
+    NEGATIVE = "\033[7m"
+    CROSSED = "\033[9m"
+    END = "\033[0m"
+
+essential_packages = [
+    'pdbr', # will also install rich
+    'tqdm',
+    'ujson',
+    'ruamel.yaml',
+]
+
+try:
+    for package in essential_packages:
+        __import__(package)
+except ImportError as e:
+    print(f'{Colors.YELLOW}{Colors.BOLD}Missing package: {Colors.RED}{Colors.BOLD}{e}{Colors.YELLOW}{Colors.BOLD}, trying to hot install using pip...{Colors.END}')
+    import sys
+    import subprocess
+    subprocess.call([sys.executable, '-m', 'ensurepip'])
+    subprocess.call([sys.executable, '-m', 'pip', 'install', *essential_packages])
+
+
 # This file should serve as a drop in replacement for log_utils.py
 import os
 import re
@@ -38,6 +84,7 @@ from easyvolcap.utils.base_utils import default_dotdict, dotdict, DoNothing
 pdbr_theme = 'ansi_dark'
 pdbr.utils.set_traceback(pdbr_theme)
 RichPdb._theme = pdbr_theme
+# fmt: on
 
 
 class MyYAML(YAML):
@@ -64,7 +111,7 @@ verbose_time_format = '%Y-%m-%d %H:%M:%S.%f'
 do_nothing_console = Console(file=StringIO(), stderr=StringIO())
 console = Console(soft_wrap=True, tab_size=4, log_time_format=slim_time_format, width=slim_width, log_time=slim_log_time, log_path=slim_log_path)  # shared
 progress = Progress(console=console, expand=True)  # destroyed
-live = Live(console=console, refresh_per_second=1)  # destroyed
+live = Live(console=console, refresh_per_second=10)  # destroyed
 traceback.install(console=console, width=slim_width)  # for colorful tracebacks
 pretty.install(console=console)
 
@@ -217,6 +264,7 @@ def path(string):  # add path markup
 def red(string: str) -> str: return f'[red bold]{string}[/]'
 def blue(string: str) -> str: return f'[blue bold]{string}[/]'
 def cyan(string: str) -> str: return f'[cyan bold]{string}[/]'
+def pink(string: str) -> str: return f'[bright_magenta bold]{string}[/]'
 def green(string: str) -> str: return f'[green bold]{string}[/]'
 def yellow(string: str) -> str: return f'[yellow bold]{string}[/]'
 def magenta(string: str) -> str: return f'[magenta bold]{string}[/]'
@@ -226,6 +274,7 @@ def color(string: str, color: str): return f'[{color} bold]{string}[/]'
 def red_slim(string: str) -> str: return f'[red]{string}[/]'
 def blue_slim(string: str) -> str: return f'[blue]{string}[/]'
 def cyan_slim(string: str) -> str: return f'[cyan]{string}[/]'
+def pink_slim(string: str) -> str: return f'[bright_magenta]{string}[/]'
 def green_slim(string: str) -> str: return f'[green]{string}[/]'
 def yellow_slim(string: str) -> str: return f'[yellow]{string}[/]'
 def magenta_slim(string: str) -> str: return f'[magenta]{string}[/]'
@@ -550,12 +599,24 @@ def time_function(sync_cuda: bool = True):
 
 
 class Timer:
-    def __init__(self, name='', disabled: bool = False, sync_cuda: bool = True):
+    def __init__(self,
+                 name='base',
+                 exp_name='',
+                 record_dir: str = 'data/timing',
+                 disabled: bool = False,
+                 sync_cuda: bool = True,
+                 record_to_file: bool = False,
+                 ):
         self.sync_cuda = sync_cuda
         self.disabled = disabled
         self.name = name
+        self.exp_name = exp_name
         self.start_time = time.perf_counter()  # manually record another start time incase timer is disabled during initialization
         self.start()  # you can always restart multiple times to reuse this timer
+
+        self.record_to_file = record_to_file
+        if self.record_to_file:
+            self.timing_record = dotdict()
 
     def __enter__(self):
         self.start()
@@ -587,6 +648,13 @@ class Timer:
         if self.disabled: return 0
         self.name = event
         diff = self.stop(print=bool(event), back=3)
+        if self.record_to_file and event:
+            if event not in self.timing_record:
+                self.timing_record[event] = []
+            self.timing_record[event].append(diff)
+
+            with open(join(self.record_dir, f'{self.exp_name}.json'), 'w') as f:
+                json.dump(self.timing_record, f, indent=4)
         self.start()
         return diff
 
@@ -649,21 +717,40 @@ def display_table(states: dotdict,
 
     # MARK: check performance hit of these calls
     start_live()
-    live.update(create_table(keys, rows, styles))  # disabled autorefresh
+    table = create_table(keys, rows, styles)
+    live.update(table)  # disabled autorefresh
+    return table
 
 
-def build_parser(d: dict, parser: argparse.ArgumentParser = None):
+def build_parser(d: dict, parser: argparse.ArgumentParser = None, **kwargs):
     """
-    locals().update(vars(build_parser(locals()).parse_args()))
+    args = dotdict(vars(build_parser(args, description=__doc__).parse_args()))
     """
+    if 'description' in kwargs:
+        kwargs['description'] = markup_to_ansi(green(kwargs['description']))
+
     if parser is None:
-        parser = argparse.ArgumentParser()
+        parser = argparse.ArgumentParser(formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=slim_width), **kwargs)
+
+    help_pattern = f'default = {blue("{}")}'
+
     for k, v in d.items():
-        if isinstance(v, list):
-            parser.add_argument(f'--{k}', type=type(v[0]) if len(v) else str, default=v, nargs='+')
+        if isinstance(v, dict):
+            if 'default' in v:
+                # Use other params as kwargs
+                d = v.pop('default')
+                t = v.pop('type', type(d))
+                h = v.pop('help', markup_to_ansi(help_pattern.format(d)))
+                parser.add_argument(f'--{k}', default=d, type=t, help=h, **v)
+            else:
+                # TODO: Add argparse group here
+                pass
+        elif isinstance(v, list):
+            parser.add_argument(f'--{k}', type=type(v[0]) if len(v) else str, default=v, nargs='+', help=markup_to_ansi(help_pattern.format(v)))
         elif isinstance(v, bool):
-            parser.add_argument(f'--{k}', action='store_false' if v else 'store_true')
+            t = 'no_' + k if v else k
+            parser.add_argument(f'--{t}', action='store_false' if v else 'store_true', dest=k, help=markup_to_ansi(help_pattern.format(v)))
         else:
-            parser.add_argument(f'--{k}', type=type(v), default=v)
-        # TODO: Add argparse group here
+            parser.add_argument(f'--{k}', type=type(v), default=v, help=markup_to_ansi(help_pattern.format(v)))
+
     return parser

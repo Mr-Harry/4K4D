@@ -21,11 +21,12 @@ from easyvolcap.engine import cfg
 from easyvolcap.engine import SAMPLERS, EMBEDDERS, REGRESSORS
 from easyvolcap.models.samplers.uniform_sampler import UniformSampler
 from easyvolcap.models.samplers.super_charged_r4dv import SuperChargedR4DV, average_single_frame, load_state_dict_kwargs
+from easyvolcap.models.samplers.point_planes_sampler import PointPlanesSampler
 from easyvolcap.models.networks.noop_network import NoopNetwork
 
 from easyvolcap.utils.console_utils import *
-from easyvolcap.utils.ibr_utils import compute_src_inps
-from easyvolcap.utils.net_utils import load_network, crop_using_mask, get_bound_2d_bound, freeze_module, register_memory, make_buffer, VolumetricVideoModule
+from easyvolcap.utils.cuda_utils import register_memory
+from easyvolcap.utils.net_utils import make_buffer, VolumetricVideoModule
 from easyvolcap.utils.data_utils import DataSplit, UnstructuredTensors, load_resize_undist_ims_bytes, load_image_from_bytes, as_torch_func, to_cuda, to_cpu, to_tensor, export_pts, load_pts, decode_crop_fill_ims_bytes, decode_fill_ims_bytes
 
 from easyvolcap.dataloaders.datasets.image_based_dataset import ImageBasedDataset
@@ -46,7 +47,14 @@ def forward_bg(self: SuperChargedR4DV,
     rgbw = self.fetch(index, [self.rgbws])  # will initiate copy for both rgbw and sh
     rgbw = torch.stack([v[0] for v in rgbw])
     cent = torch.stack([self.cents[l] for l in index])  # B, S, 3
-    rgb = self.get_rgb(batch.R.half(), batch.T.half(), xyz, sh, rgbw, cent, self.n_srcs, self.n_shs, self.resd_limit)
+
+    if self.skip_shs:
+        sh[:] = 0
+    if self.skip_base:
+        sh = sh.abs()
+        rgbw[..., :3] = 0
+
+    rgb = self.get_rgb(batch.R.half(), batch.T.half(), xyz, sh, rgbw, cent, self.n_srcs, self.n_shs, self.ibr_resd_limit)
 
     if return_frags:
         return None, xyz, rgb, rad, occ

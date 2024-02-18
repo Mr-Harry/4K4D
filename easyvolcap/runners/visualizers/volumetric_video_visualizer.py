@@ -9,7 +9,7 @@ from easyvolcap.engine import cfg, args  # global
 from easyvolcap.engine import VISUALIZERS
 from easyvolcap.utils.console_utils import *
 from easyvolcap.utils.base_utils import dotdict
-from easyvolcap.utils.net_utils import normalize
+from easyvolcap.utils.math_utils import normalize
 from easyvolcap.utils.color_utils import colormap
 from easyvolcap.utils.depth_utils import depth_curve_fn
 from easyvolcap.utils.parallel_utils import parallel_execution
@@ -35,12 +35,14 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
                      Visualization.ALPHA.name,
                  ],
 
-                 stream_delay: int = 5,  # after this number of pending copy, start synchronizing the stream and saving to disk
-                 pool_limit: int = 5,  # maximum number of pending tasks in the thread pool, keep this small to avoid using too much resource
+                 stream_delay: int = 2,  # after this number of pending copy, start synchronizing the stream and saving to disk
+                 pool_limit: int = 10,  # maximum number of pending tasks in the thread pool, keep this small to avoid using too much resource
                  video_fps: int = 60,
                  verbose: bool = True,
+
+                 dpt_curve: str = 'normalize',  # looks good
+                 dpt_mult: float = 1.0,
                  dpt_cm: str = 'virdis' if args.type != 'gui' else 'linear',  # looks good
-                 #  dpt_cm: str = 'linear',  # looks good
                  ):
         super().__init__()
 
@@ -69,6 +71,8 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
 
         self.video_fps = video_fps
         self.verbose = verbose
+        self.dpt_curve = dpt_curve
+        self.dpt_mult = dpt_mult
         self.dpt_cm = dpt_cm
 
         if self.verbose:
@@ -96,9 +100,19 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
                 img_gt = norm_curve_fn(batch.norm)
 
         elif type == Visualization.DEPTH:
-            img = depth_curve_fn(output.dpt_map, cm=self.dpt_cm)
-            if self.store_ground_truth and 'depth' in batch:
-                img_gt = depth_curve_fn(batch.depth, cm=self.dpt_cm)
+            if self.dpt_curve == 'linear':
+                img = output.dpt_map
+            else:
+                img = depth_curve_fn(output.dpt_map, cm=self.dpt_cm)
+            # img = (img - 0.5) * self.dpt_mult + 0.5
+            img = img * self.dpt_mult
+            if self.store_ground_truth and 'dpt' in batch:
+                if self.dpt_curve == 'linear':
+                    img_gt = batch.dpt
+                else:
+                    img_gt = depth_curve_fn(batch.dpt, cm=self.dpt_cm)
+                # img_gt = (img_gt - 0.5) * self.dpt_mult + 0.5
+                img_gt = img_gt * self.dpt_mult
 
         elif type == Visualization.FEATURE:
             # This visualizes the xyzt + xyz feature output
@@ -135,6 +149,10 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
 
         else:
             raise NotImplementedError(f'Unimplemented visualization type: {type}')
+
+        if img_gt is not None and 'bg_color' in output and 'msk' in batch:
+            # Fill gt with input BG colors
+            img_gt = img_gt + output.bg_color * (1 - batch.msk)
 
         if self.store_image_error and img_gt is not None:
             img_error = (img - img_gt).pow(2).sum(dim=-1).clip(0, 1)[..., None].expand(img.shape)
@@ -279,7 +297,11 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
                 result_dir = dirname(join(self.result_dir, self.img_pattern)).format(type=type.name, camera=self.camera, frame=self.frame)
                 result_str = f'"{result_dir}/*{self.vis_ext}"'
                 output_path = result_str[1:].split('*')[0][:-1] + '.mp4'
-                generate_video(result_str, output_path, self.video_fps)  # one video for one type?
+                try:
+                    generate_video(result_str, output_path, self.video_fps)  # one video for one type?
+                except RuntimeError as e:
+                    log(yellow('Error encountered during video composition, will retry without hardware encoding'))
+                    generate_video(result_str, output_path, self.video_fps, hwaccel='none', preset='veryslow', vcodec='libx265')  # one video for one type?
                 log(f'Video generated: {blue(output_path)}')
                 # TODO: use timg/tiv to visaulize the video / image on disk to the commandline
 
