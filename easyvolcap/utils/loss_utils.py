@@ -4,10 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models.vgg as vgg
 from collections import namedtuple
+from typing import Callable
+
+from math import exp
+from torch.autograd import Variable
 
 from easyvolcap.utils.prop_utils import searchsorted, matchup_channels
+from easyvolcap.utils.console_utils import *
 
 from enum import Enum, auto
+
 
 class ElasticLossReduceType(Enum):
     WEIGHT = auto()
@@ -21,6 +27,29 @@ class ImgLossType(Enum):
     L1 = auto()
     L2 = auto()
     SSIM = auto()
+    MSSSIM = auto()
+    WL1 = auto()
+
+
+class DptLossType(Enum):
+    SMOOTHL1 = auto()
+    L1 = auto()
+    L2 = auto()
+    SSIMSE = auto()
+    SSIMAE = auto()
+    SILOG = auto()
+    CONTINUITY = auto()
+    RANKING = auto()
+
+
+def compute_val_pair_around_range(pts: torch.Tensor, decoder: Callable[[torch.Tensor], torch.Tensor], diff_range: float):
+    # sample around input point and compute values
+    # pts and its random neighbor are concatenated in second dimension
+    # if needed, decoder should return multiple values together to save computation
+    neighbor = pts + (torch.rand_like(pts) - 0.5) * diff_range
+    full_pts = torch.cat([pts, neighbor], dim=-2)  # cat in n_masked dim
+    raw: torch.Tensor = decoder(full_pts)  # (n_batch, n_masked, 3)
+    return raw
 
 # from mipnerf360
 
@@ -228,114 +257,15 @@ def reg_raw_crit(x: torch.Tensor, iter_step: int, max_weight: float = 1e-4, ann_
     return loss, weight
 
 
-class LossNetwork(torch.nn.Module):
-    """Reference:
-        https://discuss.pytorch.org/t/how-to-extract-features-of-an-image-from-a-trained-model/119/3
-    """
+def lpips(x: torch.Tensor, y: torch.Tensor):
+    # B, 3, H, W
+    # B, 3, H, W
+    if not hasattr(lpips, 'compute_lpips'):
+        import lpips as lpips_module
+        log('Initializing LPIPS network')
+        lpips.compute_lpips = lpips_module.LPIPS(net='vgg', verbose=False).cuda()
 
-    def __init__(self):
-        super(LossNetwork, self).__init__()
-        try:
-            from torchvision.models import VGG19_Weights
-            self.vgg_layers = vgg.vgg19(weights=VGG19_Weights.DEFAULT).features
-        except ImportError:
-            self.vgg_layers = vgg.vgg19(pretrained=True).features
-
-        for param in self.vgg_layers.parameters():
-            param.requires_grad = False
-        '''
-        self.layer_name_mapping = {
-            '3': "relu1",
-            '8': "relu2",
-            '17': "relu3",
-            '26': "relu4",
-            '35': "relu5",
-        }
-        '''
-
-        self.layer_name_mapping = {'3': "relu1", '8': "relu2"}
-
-    def forward(self, x):
-        output = {}
-        for name, module in self.vgg_layers._modules.items():
-            x = module(x)
-            if name in self.layer_name_mapping:
-                output[self.layer_name_mapping[name]] = x
-            if name == '8':
-                break
-        LossOutput = namedtuple("LossOutput", ["relu1", "relu2"])
-        return LossOutput(**output)
-
-
-class PerceptualLoss(torch.nn.Module):
-    def __init__(self):
-        super(PerceptualLoss, self).__init__()
-
-        self.model = LossNetwork()
-        self.model.cuda()
-        self.model.eval()
-        self.mse_loss = torch.nn.MSELoss(reduction='mean')
-        self.l1_loss = torch.nn.L1Loss(reduction='mean')
-
-    def forward(self, x, target):
-        x_feature = self.model(x[:, 0:3, :, :])
-        target_feature = self.model(target[:, 0:3, :, :])
-
-        feature_loss = (
-            self.l1_loss(x_feature.relu1, target_feature.relu1) +
-            self.l1_loss(x_feature.relu2, target_feature.relu2)) / 2.0
-
-        l1_loss = self.l1_loss(x, target)
-        l2_loss = self.mse_loss(x, target)
-
-        loss = feature_loss + l1_loss + l2_loss
-
-        return loss
-
-
-class VGGPerceptualLoss(torch.nn.Module):
-    def __init__(self, resize=False):
-        super(VGGPerceptualLoss, self).__init__()
-        blocks = []
-        import torchvision
-        vgg16 = torchvision.models.vgg16(pretrained=True)
-        blocks.append(vgg16.features[:4].eval())
-        blocks.append(vgg16.features[4:9].eval())
-        blocks.append(vgg16.features[9:16].eval())
-        blocks.append(vgg16.features[16:23].eval())
-        for bl in blocks:
-            for p in bl.parameters():
-                p.requires_grad = False
-        self.blocks = nn.ModuleList(blocks)
-        self.transform = F.interpolate
-        self.resize = resize
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def forward(self, input, target, feature_layers=[0, 1, 2, 3], style_layers=[]):
-        if input.shape[1] != 3:
-            input = input.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
-        input = (input - self.mean) / self.std
-        target = (target - self.mean) / self.std
-        if self.resize:
-            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
-            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
-        loss = 0.0
-        x = input
-        y = target
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-            y = block(y)
-            if i in feature_layers:
-                loss += F.l1_loss(x, y)
-            if i in style_layers:
-                act_x = x.reshape(x.shape[0], x.shape[1], -1)
-                act_y = y.reshape(y.shape[0], y.shape[1], -1)
-                gram_x = act_x @ act_x.permute(0, 2, 1)
-                gram_y = act_y @ act_y.permute(0, 2, 1)
-                loss += F.l1_loss(gram_x, gram_y)
-        return loss
+    return lpips.compute_lpips(x.cuda() * 2 - 1, y.cuda() * 2 - 1).mean()
 
 
 def eikonal(x: torch.Tensor, th=1.0) -> torch.Tensor:
@@ -387,20 +317,30 @@ def l1(x: torch.Tensor, y: torch.Tensor):
     return l1_reg(x - y)
 
 
+def wl1(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
+    return l1_reg(w * (x - y))
+
+
 def l2(x: torch.Tensor, y: torch.Tensor):
     return l2_reg(x - y)
 
 
 def l1_reg(x: torch.Tensor):
-    return x.abs().sum(dim=-1).mean()
+    # return x.abs().sum(dim=-1).mean()
+    return x.abs().mean()
 
 
 def l2_reg(x: torch.Tensor) -> torch.Tensor:
-    return (x**2).sum(dim=-1).mean()
+    # return (x**2).sum(dim=-1).mean()
+    return (x**2).mean()
 
 
 def bce_loss(x: torch.Tensor, y: torch.Tensor):
     return F.binary_cross_entropy(x, y)
+
+
+def cos(x: torch.Tensor, y: torch.Tensor):
+    return (1 - F.cosine_similarity(x, y, dim=-1)).mean()
 
 
 def mIoU_loss(x: torch.Tensor, y: torch.Tensor):
@@ -555,8 +495,305 @@ def compute_time_planes_smooth(embedding):
     return loss
 
 
-def compute_ssim(x: torch.Tensor, y: torch.Tensor):
-    from pytorch_msssim import ssim
-    x = x.permute(0, 3, 1, 2)
-    y = y.permute(0, 3, 1, 2)
-    return ssim(x, y, data_range=1.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03))
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+
+def create_window(window_size, channel):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
+    return window
+
+
+def gsssim(img1, img2, window_size=11, size_average=True):
+    channel = img1.size(-3)
+    window = create_window(window_size, channel)
+
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    return _ssim(img1, img2, window, window_size, channel, size_average)
+
+
+def _ssim(img1, img2, window, window_size, channel, size_average=True):
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
+
+
+def ssim(x: torch.Tensor, y: torch.Tensor):
+    from pytorch_msssim import ssim as compute_ssim
+    return compute_ssim(x, y, data_range=1.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03))
+
+
+def msssim(x: torch.Tensor, y: torch.Tensor):
+    from pytorch_msssim import ms_ssim as compute_msssim
+    return compute_msssim(x, y, data_range=1.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03))
+
+
+# from MonoSDF
+def compute_scale_and_shift(prediction, target, mask):
+    # System matrix: A = [[a_00, a_01], [a_10, a_11]]
+    a_00 = torch.sum(mask * prediction * prediction, (1, 2))
+    a_01 = torch.sum(mask * prediction, (1, 2))
+    a_11 = torch.sum(mask, (1, 2))
+
+    # Right hand side: b = [b_0, b_1]
+    b_0 = torch.sum(mask * prediction * target, (1, 2))
+    b_1 = torch.sum(mask * target, (1, 2))
+
+    # Solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
+    x_0 = torch.zeros_like(b_0)
+    x_1 = torch.zeros_like(b_1)
+
+    det = a_00 * a_11 - a_01 * a_01
+    valid = det.nonzero()
+
+    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
+    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+
+    return x_0, x_1
+
+
+def reduction_batch_based(image_loss, M):
+    # Average of all valid pixels of the batch
+    # Avoid division by 0 (if sum(M) = sum(sum(mask)) = 0: sum(image_loss) = 0)
+    divisor = torch.sum(M)
+
+    if divisor == 0: return 0
+    else: return torch.sum(image_loss) / divisor
+
+
+def reduction_image_based(image_loss, M):
+    # Mean of average of valid pixels of an image
+    # Avoid division by 0 (if M = sum(mask) = 0: image_loss = 0)
+    valid = M.nonzero()
+    image_loss[valid] = image_loss[valid] / M[valid]
+
+    return torch.mean(image_loss)
+
+
+def mse_loss(prediction, target, mask, reduction=reduction_batch_based):
+    # Number of valid pixels
+    M = torch.sum(mask, (1, 2))  # (B,)
+
+    # L2 loss
+    res = prediction - target  # (B, H, W)
+    image_loss = torch.sum(mask * res * res, (1, 2))  # (B,)
+
+    return reduction(image_loss, 2 * M)
+
+
+def gradient_loss(prediction, target, mask, reduction=reduction_batch_based):
+
+    M = torch.sum(mask, (1, 2))
+
+    diff = prediction - target
+    diff = torch.mul(mask, diff)
+
+    grad_x = torch.abs(diff[:, :, 1:] - diff[:, :, :-1])
+    mask_x = torch.mul(mask[:, :, 1:], mask[:, :, :-1])
+    grad_x = torch.mul(mask_x, grad_x)
+
+    grad_y = torch.abs(diff[:, 1:, :] - diff[:, :-1, :])
+    mask_y = torch.mul(mask[:, 1:, :], mask[:, :-1, :])
+    grad_y = torch.mul(mask_y, grad_y)
+
+    image_loss = torch.sum(grad_x, (1, 2)) + torch.sum(grad_y, (1, 2))
+
+    return reduction(image_loss, M)
+
+
+class MSELoss(nn.Module):
+    def __init__(self, reduction='batch-based'):
+        super().__init__()
+
+        if reduction == 'batch-based':
+            self.__reduction = reduction_batch_based
+        else:
+            self.__reduction = reduction_image_based
+
+    def forward(self, prediction, target, mask):
+        return mse_loss(prediction, target, mask, reduction=self.__reduction)
+
+
+class GradientLoss(nn.Module):
+    def __init__(self, scales=1, reduction='batch-based'):
+        super().__init__()
+
+        if reduction == 'batch-based':
+            self.__reduction = reduction_batch_based
+        else:
+            self.__reduction = reduction_image_based
+
+        self.__scales = scales
+
+    def forward(self, prediction, target, mask):
+        total = 0
+
+        for scale in range(self.__scales):
+            step = pow(2, scale)
+
+            total += gradient_loss(prediction[:, ::step, ::step], target[:, ::step, ::step],
+                                   mask[:, ::step, ::step], reduction=self.__reduction)
+
+        return total
+
+
+class ScaleAndShiftInvariantMSELoss(nn.Module):
+    def __init__(self, alpha=0.5, scales=4, reduction='batch-based'):
+        super().__init__()
+
+        self.__data_loss = MSELoss(reduction=reduction)
+        self.__regularization_loss = GradientLoss(scales=scales, reduction=reduction)
+        self.__alpha = alpha
+
+        self.__prediction_ssi = None
+
+    def forward(self, prediction, target, mask):
+        # Deal with the channel dimension, the input dimension may have (B, C, H, W) or (B, H, W)
+        if prediction.ndim == 4: prediction = prediction[:, 0]  # (B, H, W)
+        if target.ndim == 4: target = target[:, 0]  # (B, H, W)
+        if mask.ndim == 4: mask = mask[:, 0]  # (B, H, W)
+
+        # Compute scale and shift
+        scale, shift = compute_scale_and_shift(prediction, target, mask)
+        self.__prediction_ssi = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
+        total = self.__data_loss(self.__prediction_ssi, target, mask)
+
+        # Add regularization if needed
+        if self.__alpha > 0:
+            total += self.__alpha * self.__regularization_loss(self.__prediction_ssi, target, mask)
+
+        return total
+
+    def __get_prediction_ssi(self):
+        return self.__prediction_ssi
+
+    prediction_ssi = property(__get_prediction_ssi)
+# from MonoSDF
+
+
+def median_normalize(x, mask):
+    """ Median normalize a tensor for all valid pixels.
+        This operation is performed without batch dimension.
+    Args:
+        x (torch.Tensor): (H, W), original tensor
+        mask (torch.Tensor): (H, W), mask tensor
+    Return:
+        y (torch.Tensor): (H, W), median normalized tensor
+    """
+    M = torch.sum(mask)
+
+    # Return original tensor if there is no valid pixel
+    if M == 0:
+        return x
+
+    # Compute median and scale
+    t = torch.quantile(x[mask == 1], q=0.5)  # scalar
+    s = torch.sum(x[mask == 1] - t) / M  # scalar
+
+    # Return median normalized tensor
+    return (x - t) / s
+
+
+def mae_loss(prediction, target, mask, reduction=reduction_batch_based):
+    # Number of valid pixels
+    M = torch.sum(mask, (1, 2))  # (B,)
+
+    # L1 loss
+    res = (prediction - target).abs()  # (B, H, W)
+    image_loss = torch.sum(mask * res, (1, 2))  # (B,)
+
+    return reduction(image_loss, 2 * M)
+
+
+class MAELoss(nn.Module):
+    def __init__(self, reduction='batch-based'):
+        super().__init__()
+
+        if reduction == 'batch-based':
+            self.__reduction = reduction_batch_based
+        else:
+            self.__reduction = reduction_image_based
+
+    def forward(self, prediction, target, mask):
+        return mae_loss(prediction, target, mask, reduction=self.__reduction)
+
+
+class ScaleAndShiftInvariantMAELoss(nn.Module):
+    def __init__(self, alpha=0.5, scales=4, reduction='batch-based'):
+        super().__init__()
+
+        self.__data_loss = MAELoss(reduction=reduction)
+        self.__regularization_loss = GradientLoss(scales=scales, reduction=reduction)
+        self.__alpha = alpha
+
+    def forward(self, prediction, target, mask):
+        # Deal with the channel dimension, the input dimension may have (B, C, H, W) or (B, H, W)
+        if prediction.ndim == 4: prediction = prediction[:, 0]  # (B, H, W)
+        if target.ndim == 4: target = target[:, 0]  # (B, H, W)
+        if mask.ndim == 4: mask = mask[:, 0]  # (B, H, W)
+
+        # TODO: Maybe there is a better way to do the batching
+        # But `torch.quantile` does not support multiple `dim` argument for now
+        for i in range(prediction.shape[0]):
+            prediction[i] = median_normalize(prediction[i], mask[i])  # (H, W)
+            target[i] = median_normalize(target[i], mask[i])  # (H, W)
+
+        # Compute the scale-and-shift invariant MAE loss
+        total = self.__data_loss(prediction, target, mask)
+
+       # Add regularization if needed
+        if self.__alpha > 0:
+            total += self.__alpha * self.__regularization_loss(self.prediction, target, mask)
+
+        return total
+
+
+# Modified version of Adabins repository
+# https://github.com/shariqfarooq123/AdaBins/blob/0952d91e9e762be310bb4cd055cbfe2448c0ce20/loss.py#L7
+class ScaleInvariantLogLoss(nn.Module):
+    def __init__(self, alpha=10.0, beta=0.15, eps=0.0):
+        super(ScaleInvariantLogLoss, self).__init__()
+
+        self.alpha = alpha
+        self.beta = beta
+        # The eps is added to avoid log(0) and division by zero
+        # But it should be gauranteed that the network output is always non-negative
+        self.eps = eps
+
+    def forward(self, prediction, target, mask):
+        # Deal with the channel dimension, the input dimension may have (B, C, H, W) or (B, H, W)
+        if prediction.ndim == 4: prediction = prediction[:, 0]  # (B, H, W)
+        if target.ndim == 4: target = target[:, 0]  # (B, H, W)
+        if mask.ndim == 4: mask = mask[:, 0]  # (B, H, W)
+
+        total = 0
+        # Maybe there is a better way to do the batching
+        for i in range(prediction.shape[0]):
+            g = torch.log(prediction[i][mask[i]] + self.eps) - torch.log(target[i][mask[i]] + self.eps)  # (N,)
+            Dg = torch.var(g) + self.beta * torch.pow(torch.mean(g), 2)  # scalar
+            total += self.alpha * torch.sqrt(Dg)
+
+        return total

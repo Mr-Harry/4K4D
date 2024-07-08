@@ -567,21 +567,21 @@ class Quad(Mesh):
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, old_fbo)
 
         if self.use_quad_cuda:
-            from cuda import cudart
-            if self.compose:
-                # Both reading and writing of this resource is required
-                flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsNone
-            else:
-                flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
             try:
+                from cuda import cudart
+                if self.compose:
+                    # Both reading and writing of this resource is required
+                    flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsNone
+                else:
+                    flags = cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard
                 self.cu_tex = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterImage(self.tex, gl.GL_TEXTURE_2D, flags))
-            except RuntimeError as e:
+            except (RuntimeError, ModuleNotFoundError) as e:
                 log(red('Failed to initialize Quad with CUDA-GL interop, will use slow upload: '), e)
                 self.use_quad_cuda = False
 
     def copy_to_texture(self, image: torch.Tensor, x: int = 0, y: int = 0, w: int = 0, h: int = 0):
         if not self.use_quad_cuda:
-            self.upload_to_texture(image)
+            self.upload_to_texture(image, x, y, w, h)
             return
 
         if not hasattr(self, 'cu_tex'):
@@ -647,7 +647,7 @@ class Quad(Mesh):
             ptr = ptr.detach().cpu().numpy()  # slow sync and copy operation # MARK: SYNC
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
-        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, x, y, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ptr[y:h, x:w])  # to gpu, might slow down?
+        gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, x, y, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, ptr)  # to gpu, might slow down?
 
     @property
     def verts_data(self):  # a heavy copy operation
@@ -939,6 +939,9 @@ class Gaussian(Mesh):
         del self.point_radius
         del self.render_normal
 
+        self.scale_mult = 1.0
+        self.alpha_mult = 1.0
+
     # Disabling initialization
     def load_from_file(self, *args, **kwargs):
         pass
@@ -960,7 +963,11 @@ class Gaussian(Mesh):
     def render(self, camera: Camera):
         # Perform actual gaussian rendering
         batch = add_batch(to_cuda(camera.to_batch()))
-        rgb, acc, dpt = self.gaussian_model.render(batch)
+        rgb, acc, dpt = self.gaussian_model.render(
+            batch=batch,
+            scale_mult=self.scale_mult,
+            alpha_mult=self.alpha_mult
+        )
 
         if self.view_depth:
             rgba = torch.cat([depth_curve_fn(dpt, cm=self.dpt_cm), acc], dim=-1)  # H, W, 4
@@ -970,9 +977,9 @@ class Gaussian(Mesh):
         # Copy rendered tensor to screen
         rgba = (rgba.clip(0, 1) * 255).type(torch.uint8).flip(0)  # transform
         self.quad.copy_to_texture(rgba)
-        self.quad.draw()
+        self.quad.render()
 
-    def render_imgui(mesh, viewer: 'VolumetricVideoViewer', batch: dotdict):
+    def render_imgui(self, viewer: 'VolumetricVideoViewer', batch: dotdict):
         super().render_imgui(viewer, batch)
 
         from imgui_bundle import imgui
@@ -980,18 +987,19 @@ class Gaussian(Mesh):
 
         i = batch.i
         imgui.same_line()
-        push_button_color(0x55cc33ff if not mesh.view_depth else 0x8855aaff)
-        if imgui.button(f'Color##{i}' if not mesh.view_depth else f' Depth ##{i}'):
-            mesh.view_depth = not mesh.view_depth
+        push_button_color(0x55cc33ff if not self.view_depth else 0x8855aaff)
+        if imgui.button(f'Color##{i}' if not self.view_depth else f' Depth ##{i}'):
+            self.view_depth = not self.view_depth
         pop_button_color()
 
+        self.scale_mult = imgui.slider_float(f'Scale multiplier', self.scale_mult, 0.1, 5.0)[1]  # 0.1mm
+        self.alpha_mult = imgui.slider_float(f'Alpha multiplier', self.alpha_mult, 0.1, 5.0)[1]  # 0.1mm
 
-class PointSplat(Gaussian):
+
+class PointSplat(Gaussian, nn.Module):
     def __init__(self,
                  filename: str = 'assets/meshes/zju3dv.ply',
-
                  quad_cfg: dotdict = dotdict(),
-
                  view_depth: bool = False,  # show depth or show color
                  dpt_cm: str = 'linear',
 
@@ -1024,22 +1032,26 @@ class PointSplat(Gaussian):
 
         # Init rendering quad
         self.quad: Quad = call_from_cfg(Quad, quad_cfg, H=H, W=W)
+        self.cuda()  # move to cuda
 
         # Other configurations
         self.view_depth = view_depth
         self.dpt_cm = dpt_cm
+        self.radius_mult = 1.0
+        self.alpha_mult = 1.0
 
     # The actual rendering function
     @torch.no_grad()
     def render(self, camera: Camera):
         # Perform actual gaussian rendering
         batch = add_batch(to_cuda(camera.to_batch()))
-        sh0 = rgb2sh0(self.rgb)
+        sh0 = rgb2sh0(self.rgb[..., None])
         xyz = self.pts
-        occ = self.occ
-        rad = self.rad
+        occ = (self.occ * self.alpha_mult).clip(0, 1)
+        rad = self.rad * self.radius_mult
 
         rgb, acc, dpt = self.render_radius(*add_batch([xyz, sh0, rad, occ]), batch)
+        rgb, acc, dpt = rgb[0], acc[0], dpt[0]
 
         if self.view_depth:
             rgba = torch.cat([depth_curve_fn(dpt, cm=self.dpt_cm), acc], dim=-1)  # H, W, 4
@@ -1050,6 +1062,14 @@ class PointSplat(Gaussian):
         rgba = (rgba.clip(0, 1) * 255).type(torch.uint8).flip(0)  # transform
         self.quad.copy_to_texture(rgba)
         self.quad.render()
+
+    def render_imgui(mesh, viewer: 'VolumetricVideoViewer', batch: dotdict):
+        super().render_imgui(viewer, batch)
+
+        i = batch.i
+        from imgui_bundle import imgui
+        mesh.radius_mult = imgui.slider_float(f'Point radius multiplier##{i}', mesh.radius_mult, 0.1, 3.0)[1]  # 0.1mm
+        mesh.alpha_mult = imgui.slider_float(f'Point alpha multiplier##{i}', mesh.alpha_mult, 0.1, 3.0)[1]  # 0.1mm
 
 
 class Splat(Mesh):  # FIXME: Not rendering, need to debug this
@@ -1088,6 +1108,9 @@ class Splat(Mesh):  # FIXME: Not rendering, need to debug this
         self.max_H, self.max_W = H, W
         self.H, self.W = H, W
         self.init_textures()
+
+        from easyvolcap.models.samplers.gaussiant_sampler import GaussianTSampler
+        self.render_radius = MethodType(GaussianTSampler.render_radius, self)  # override the method
 
     @property
     def verts_data(self):  # a heavy copy operation
@@ -1296,9 +1319,10 @@ class HardwareRendering(Splat):
         try:
             self.cu_vbo = CHECK_CUDART_ERROR(cudart.cudaGraphicsGLRegisterBuffer(self.vbo, flags))
         except RuntimeError as e:
-            log(red(f'Your system does not support CUDA-GL interop, please use pytorch3d\'s implementation instead'))
+            log(red(f'Your system does not support CUDA-GL interop, will use pytorch3d\'s implementation instead'))
             log(red(f'This can be done by specifying {blue("model_cfg.sampler_cfg.use_cudagl=False model_cfg.sampler_cfg.use_diffgl=False")} at the end of your command'))
             log(red(f'Note that this implementation is extremely slow, we recommend running on a native system that support the interop'))
+            log(red(f'An alternative is to install diff_point_rasterization and use the approximated tile-based rasterization, enabled by the `render_gs` switch'))
             # raise RuntimeError(str(e) + ": This unrecoverable, please read the error message above")
             raise e
 

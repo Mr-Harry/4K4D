@@ -7,6 +7,7 @@ if TYPE_CHECKING:
 import glm
 import torch
 import numpy as np
+from typing import List, Optional
 
 from os.path import join
 from scipy import interpolate
@@ -371,19 +372,40 @@ class CameraPath:
         pass
 
 
+def lookat_bounds(bounds: List[List[float]], world_up: List[float], camera_center: Optional[List[float]] = None):
+    # Look at the bound center
+    bounds = torch.as_tensor(bounds, dtype=torch.float)  # 2, 3
+    scene_center = bounds.mean(0)  # 3,
+
+    if camera_center is None:
+        camera_center = (bounds[0] - scene_center) * 1.5 + scene_center  # 3,
+
+    world_up = torch.as_tensor(world_up, dtype=torch.float)  # 3,
+    c2w = torch.eye(4)
+    c2w[:3, 3] = camera_center
+    z = normalize(scene_center - camera_center)
+    x = torch.cross(z, world_up)
+    y = torch.cross(z, x)
+    c2w[:3, :3] = torch.stack([x, y, z]).mT  # 3, 3
+    w2c = affine_inverse(c2w)
+    R = w2c[:3, :3]
+    T = w2c[:3, 3:]
+    return R, T
+
+
 class Camera:
     # Helper class to manage camera parameters
     def __init__(self,
-                 H: int = 512,
-                 W: int = 512,
-                 K: torch.Tensor = torch.tensor([[512.0, 0.0, 256], [0.0, 512.0, 256.0], [0.0, 0.0, 1.0]]),  # intrinsics
+                 H: int = 768,
+                 W: int = 1366,
+                 K: torch.Tensor = torch.tensor([[1366.0, 0.0, 683], [0.0, 1366.0, 384.0], [0.0, 0.0, 1.0]]),  # intrinsics
                  R: torch.Tensor = torch.tensor([[-0.9977766275405884, 0.06664637476205826, 0.0], [0.004728599451482296, 0.07079283893108368, -0.9974799156188965], [-0.0664784237742424, -0.9952622056007385, -0.07095059007406235]]),  # extrinsics
                  T: torch.Tensor = torch.tensor([[-2.059340476989746e-5], [2.5779008865356445e-6], [-3.000047445297241]]),  # extrinsics
                  n: float = 0.002,  # bounds limit
-                 f: float = 100,  # bounds limit
+                 f: float = 1000,  # bounds limit
                  t: float = 0.0,  # temporal dimension (implemented as a float instead of int)
                  v: float = 0.0,  # view dimension (implemented as a float instead of int)
-                 bounds: torch.Tensor = torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),  # bounding box
+                 bounds: torch.Tensor = torch.tensor([[-100.0, -100.0, -100.0], [100.0, 100.0, 100.0]]),  # bounding box
 
                  # camera update hyperparameters
                  origin: torch.Tensor = torch.tensor([0.0, 0.0, 0.0]),
@@ -411,6 +433,7 @@ class Camera:
             if batch is None:
                 batch = dotdict()
                 batch.H, batch.W, batch.K, batch.R, batch.T, batch.n, batch.f, batch.t, batch.v, batch.bounds = H, W, K, R, T, n, f, t, v, bounds
+            batch = to_tensor(batch, ignore_list=True)
             self.from_batch(batch)
 
             # Other configurables
@@ -502,13 +525,15 @@ class Camera:
         self.drag_ymax = np.pi + self.drag_ymin - 0.02  # remove the 0.01 of drag_ymin
 
         # Rotate about euler angle
-        m = mat4(1.0)
-        m = glm.rotate(m, np.clip(delta.x, self.drag_ymin, self.drag_ymax), self.right)
-        m = glm.rotate(m, delta.y, -self.world_up)
-        m = glm.rotate(m, delta.z, self.front)
-        center = self.center
-        self.front = m @ self.front  # might overshoot and will update center
-        self.center = center
+        EPS = 1e-7
+        if abs(delta.x) > EPS or abs(delta.y) > EPS or abs(delta.z) > EPS:
+            m = mat4(1.0)
+            m = glm.rotate(m, np.clip(delta.x, self.drag_ymin, self.drag_ymax), self.right)
+            m = glm.rotate(m, delta.y, -self.world_up)
+            m = glm.rotate(m, delta.z, self.front)
+            center = self.center
+            self.front = m @ self.front  # might overshoot and will update center
+            self.center = center
 
     @property
     def w2p(self):

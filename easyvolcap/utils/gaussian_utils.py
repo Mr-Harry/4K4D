@@ -13,36 +13,93 @@ from easyvolcap.utils.net_utils import make_buffer, make_params, typed
 from easyvolcap.utils.math_utils import torch_inverse_2x2, point_padding
 
 
-# def in_frustrum(xyz: torch.Tensor, ixt: torch.Tensor, ext: torch.Tensor):
-def in_frustrum(xyz: torch.Tensor, full_proj_matrix: torch.Tensor, padding: float = 0.01):
-    # __forceinline__ __device__ bool in_frustum(int idx,
-    # 	const float* orig_points,
-    # 	const float* viewmatrix,
-    # 	const float* projmatrix,
-    # 	bool prefiltered,
-    # 	float3& p_view,
-    # 	const float padding = 0.01f // padding in ndc space
-    # 	)
-    # {
-    # 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+def render_diff_gauss(xyz3: torch.Tensor, rgb3: torch.Tensor, cov: torch.Tensor, occ1: torch.Tensor, camera: dotdict):
+    from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
+    # Prepare rasterization settings for gaussian
+    raster_settings = GaussianRasterizationSettings(
+        image_height=camera.image_height,
+        image_width=camera.image_width,
+        tanfovx=camera.tanfovx,
+        tanfovy=camera.tanfovy,
+        bg=torch.full([3], 0.0, device=xyz3.device),  # GPU
+        scale_modifier=1.0,
+        viewmatrix=camera.world_view_transform,
+        projmatrix=camera.full_proj_transform,
+        sh_degree=0,
+        campos=camera.camera_center,
+        prefiltered=True,
+        debug=False,
+    )
 
-    # 	// Bring points to screen space
-    # 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
-    # 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-    # 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
-    # 	p_view = transformPoint4x3(p_orig, viewmatrix); // write this outside
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    scr = torch.zeros_like(xyz3, requires_grad=True) + 0  # gradient magic
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rendered_image, rendered_depth, rendered_alpha, radii = typed(torch.float, torch.float)(rasterizer)(
+        means3D=xyz3,
+        means2D=scr,
+        shs=None,
+        colors_precomp=rgb3,
+        opacities=occ1,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=cov,
+    )
 
-    # 	// if (idx % 32768 == 0) printf("Viewspace point: %f, %f, %f\n", p_view.x, p_view.y, p_view.z);
-    # 	// if (idx % 32768 == 0) printf("Projected point: %f, %f, %f\n", p_proj.x, p_proj.y, p_proj.z);
-    # 	return (p_proj.z > -1 - padding) && (p_proj.z < 1 + padding) && (p_proj.x > -1 - padding) && (p_proj.x < 1. + padding) && (p_proj.y > -1 - padding) && (p_proj.y < 1. + padding);
-    # }
+    rgb = rendered_image[None].permute(0, 2, 3, 1)
+    acc = rendered_alpha[None].permute(0, 2, 3, 1)
+    dpt = rendered_depth[None].permute(0, 2, 3, 1)
+    H = camera.image_height
+    W = camera.image_width
+    meta = dotdict({'radii': radii / float(max(H, W)), 'scr': scr, 'H': H, 'W': W})
+    return rgb, acc, dpt, meta
 
-    # xyz: N, 3
-    # ndc = (xyz @ R.mT + T)[..., :3] @ K # N, 3
-    # ndc[..., :2] = ndc[..., :2] / ndc[..., 2:] / torch.as_tensor([W, H], device=ndc.device) # N, 2, normalized x and y
-    ndc = point_padding(xyz) @ full_proj_matrix
+
+def render_fdgs(xyz3: torch.Tensor, rgb3: torch.Tensor, cov: torch.Tensor, occ1: torch.Tensor, camera: dotdict):
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+    # Prepare rasterization settings for gaussian
+    raster_settings = GaussianRasterizationSettings(
+        image_height=camera.image_height,
+        image_width=camera.image_width,
+        tanfovx=camera.tanfovx,
+        tanfovy=camera.tanfovy,
+        bg=torch.full([3], 0.0, device=xyz3.device),  # GPU
+        scale_modifier=1.0,
+        viewmatrix=camera.world_view_transform,
+        projmatrix=camera.full_proj_transform,
+        sh_degree=0,
+        campos=camera.camera_center,
+        prefiltered=True,
+        debug=False
+    )
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    scr = torch.zeros_like(xyz3, requires_grad=True) + 0  # gradient magic
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rendered_image, radii = typed(torch.float, torch.float)(rasterizer)(
+        means3D=xyz3,
+        means2D=scr,
+        shs=None,
+        colors_precomp=rgb3,
+        opacities=occ1,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=cov,
+    )
+
+    rgb = rendered_image[None].permute(0, 2, 3, 1)
+    acc = torch.ones_like(rgb[..., :1])
+    dpt = torch.zeros_like(rgb[..., :1])
+    H = camera.image_height
+    W = camera.image_width
+    meta = dotdict({'radii': radii / float(max(H, W)), 'scr': scr, 'H': H, 'W': W})
+    return rgb, acc, dpt, meta
+
+
+@torch.jit.script
+def in_frustrum(xyz: torch.Tensor, full_proj_matrix: torch.Tensor, xy_padding: float = 0.5, padding: float = 0.01):
+    ndc = point_padding(xyz) @ full_proj_matrix # this is now in clip space
     ndc = ndc[..., :3] / ndc[..., 3:]
-    return (ndc[..., 2] > -1 - padding) & (ndc[..., 2] < 1 + padding) & (ndc[..., 0] > -1 - padding) & (ndc[..., 0] < 1. + padding) & (ndc[..., 1] > -1 - padding) & (ndc[..., 1] < 1. + padding)  # N,
+    return (ndc[..., 2] > -1 - padding) & (ndc[..., 2] < 1 + padding) & (ndc[..., 0] > -1 - xy_padding) & (ndc[..., 0] < 1. + xy_padding) & (ndc[..., 1] > -1 - xy_padding) & (ndc[..., 1] < 1. + xy_padding)  # N,
 
 
 @torch.jit.script
@@ -101,28 +158,35 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 
+@torch.jit.script
 def strip_lowerdiag(L: torch.Tensor):
-    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device=L.device)
+    # uncertainty = torch.zeros((L.shape[0], 6), dtype=L.dtype, device=L.device)
 
-    uncertainty[:, 0] = L[:, 0, 0]
-    uncertainty[:, 1] = L[:, 0, 1]
-    uncertainty[:, 2] = L[:, 0, 2]
-    uncertainty[:, 3] = L[:, 1, 1]
-    uncertainty[:, 4] = L[:, 1, 2]
-    uncertainty[:, 5] = L[:, 2, 2]
-    return uncertainty
+    # uncertainty[:, 0] = L[:, 0, 0].clip(0.0)  # sanitize covariance matrix
+    # uncertainty[:, 1] = L[:, 0, 1]
+    # uncertainty[:, 2] = L[:, 0, 2]
+    # uncertainty[:, 3] = L[:, 1, 1].clip(0.0)  # sanitize covariance matrix
+    # uncertainty[:, 4] = L[:, 1, 2]
+    # uncertainty[:, 5] = L[:, 2, 2].clip(0.0)  # sanitize covariance matrix
+    # return uncertainty
+
+    inds = torch.triu_indices(3, 3, device=L.device)  # 2, 6
+    return L[:, inds[0], inds[1]]
 
 
 def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
 
-def build_rotation(r: torch.Tensor):
-    norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
+@torch.jit.script
+def build_rotation(q: torch.Tensor):
+    assert q.shape[-1] == 4
+    # norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
 
-    q = r / norm[:, None]
+    # q = r / norm[:, None]
+    q = F.normalize(q, dim=-1)
 
-    R = torch.zeros((q.size(0), 3, 3), device=r.device)
+    R = torch.zeros((q.size(0), 3, 3), dtype=q.dtype, device=q.device)
 
     r = q[:, 0]
     x = q[:, 1]
@@ -141,9 +205,10 @@ def build_rotation(r: torch.Tensor):
     return R
 
 
-def build_scaling_rotation(s: torch.Tensor, r: torch.Tensor):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device=s.device)
-    R = build_rotation(r)
+@torch.jit.script
+def build_scaling_rotation(s: torch.Tensor, q: torch.Tensor):
+    L = torch.zeros((s.shape[0], 3, 3), dtype=s.dtype, device=s.device)
+    R = build_rotation(q)
 
     L[:, 0, 0] = s[:, 0]
     L[:, 1, 1] = s[:, 1]
@@ -154,36 +219,39 @@ def build_scaling_rotation(s: torch.Tensor, r: torch.Tensor):
 
 
 def fov2focal(fov, pixels):
-    return pixels / (2 * math.tan(fov / 2))
+    return pixels / (2 * np.tan(fov / 2))
 
 
 def focal2fov(focal, pixels):
-    return 2 * math.atan(pixels / (2 * focal))
+    return 2 * np.arctan(pixels / (2 * focal))
 
 
+@torch.jit.script
 def getWorld2View(R: torch.Tensor, t: torch.Tensor):
     """
     R: ..., 3, 3
     T: ..., 3, 1
     """
     sh = R.shape[:-2]
-    T = torch.zeros((*sh, 4, 4), dtype=R.dtype, device=R.device)
+    T = torch.eye(4, dtype=R.dtype, device=R.device)  # 4, 4
+    for i in range(len(sh)):
+        T = T.unsqueeze(0)
+    T = T.expand(sh + (4, 4))
     T[..., :3, :3] = R
     T[..., :3, 3:] = t
-    T[..., 3, 3] = 1.0
     return T
 
 
-def getProjectionMatrix(K: torch.Tensor, H, W, znear=0.001, zfar=1000):
+@torch.jit.script
+def getProjectionMatrix(K: torch.Tensor, H: torch.Tensor, W: torch.Tensor, znear: torch.Tensor, zfar: torch.Tensor):
     fx = K[0, 0]
     fy = K[1, 1]
     cx = K[0, 2]
     cy = K[1, 2]
     s = K[0, 1]
+    one = K[2, 2]
 
     P = torch.zeros(4, 4, dtype=K.dtype, device=K.device)
-
-    z_sign = 1.0
 
     P[0, 0] = 2 * fx / W
     P[0, 1] = 2 * s / W
@@ -192,19 +260,21 @@ def getProjectionMatrix(K: torch.Tensor, H, W, znear=0.001, zfar=1000):
     P[1, 1] = 2 * fy / H
     P[1, 2] = -1 + 2 * (cy / H)
 
-    P[2, 2] = z_sign * (zfar + znear) / (zfar - znear)
-    P[2, 3] = z_sign * 2 * zfar * znear / (zfar - znear)
-    P[3, 2] = z_sign
+    P[2, 2] = -(zfar + znear) / (znear - zfar)
+    P[2, 3] = 2 * zfar * znear / (znear - zfar)
+
+    P[3, 2] = one
 
     return P
 
 
 def prepare_gaussian_camera(batch):
     output = dotdict()
-    H, W, K, R, T, n, f = batch.meta.H.item(), batch.meta.W.item(), batch.K[0], batch.R[0], batch.T[0], batch.meta.n.item(), batch.meta.f.item()
+    H, W, K, R, T, n, f = batch.H[0], batch.W[0], batch.K[0], batch.R[0], batch.T[0], batch.n[0], batch.f[0]
+    cpu_H, cpu_W, cpu_K, cpu_R, cpu_T, cpu_n, cpu_f = batch.meta.H[0], batch.meta.W[0], batch.meta.K[0], batch.meta.R[0], batch.meta.T[0], batch.meta.n[0], batch.meta.f[0]
 
-    output.image_height = H
-    output.image_width = W
+    output.image_height = cpu_H
+    output.image_width = cpu_W
 
     output.K = K
     output.R = R
@@ -213,13 +283,13 @@ def prepare_gaussian_camera(batch):
     fl_x = batch.meta.K[0][0, 0]  # use cpu K
     fl_y = batch.meta.K[0][1, 1]  # use cpu K
 
-    output.FoVx = focal2fov(fl_x, output.image_width)
-    output.FoVy = focal2fov(fl_y, output.image_height)
+    output.FoVx = focal2fov(fl_x, cpu_W)
+    output.FoVy = focal2fov(fl_y, cpu_H)
 
-    output.world_view_transform = getWorld2View(output.R, output.T).transpose(0, 1)
-    output.projection_matrix = getProjectionMatrix(output.K, output.image_height, output.image_width, n, f).transpose(0, 1)
+    output.world_view_transform = getWorld2View(R, T).transpose(0, 1)
+    output.projection_matrix = getProjectionMatrix(K, H, W, n, f).transpose(0, 1)
     output.full_proj_transform = torch.matmul(output.world_view_transform, output.projection_matrix)
-    output.camera_center = output.world_view_transform.float().inverse()[3:, :3].to(output.world_view_transform)
+    output.camera_center = (-R.mT @ T)[..., 0]  # B, 3, 1 -> 3,
 
     # Set up rasterization configuration
     output.tanfovx = math.tan(output.FoVx * 0.5)
@@ -231,34 +301,42 @@ def prepare_gaussian_camera(batch):
 def convert_to_gaussian_camera(K: torch.Tensor,
                                R: torch.Tensor,
                                T: torch.Tensor,
-                               H: int,
-                               W: int,
-                               znear: float = 0.01,
-                               zfar: float = 100.
+                               H: torch.Tensor,
+                               W: torch.Tensor,
+                               n: torch.Tensor,
+                               f: torch.Tensor,
+                               cpu_K: torch.Tensor,
+                               cpu_R: torch.Tensor,
+                               cpu_T: torch.Tensor,
+                               cpu_H: int,
+                               cpu_W: int,
+                               cpu_n: float = 0.01,
+                               cpu_f: float = 100.,
                                ):
     output = dotdict()
 
-    output.image_height = H
-    output.image_width = W
+    output.image_height = cpu_H
+    output.image_width = cpu_W
 
     output.K = K
     output.R = R
     output.T = T
 
-    fl_x = K[0, 0]
-    fl_y = K[1, 1]
+    output.znear = cpu_n
+    output.zfar = cpu_f
 
-    output.FoVx = focal2fov(fl_x, output.image_width)
-    output.FoVy = focal2fov(fl_y, output.image_height)
+    output.FoVx = focal2fov(cpu_K[0, 0].cpu(), cpu_W.cpu())  # MARK: MIGHT SYNC IN DIST TRAINING, WHY?
+    output.FoVy = focal2fov(cpu_K[1, 1].cpu(), cpu_H.cpu())  # MARK: MIGHT SYNC IN DIST TRAINING, WHY?
 
-    output.world_view_transform = getWorld2View(output.R, output.T).transpose(0, 1)
-    output.projection_matrix = getProjectionMatrix(output.K, output.image_height, output.image_width, znear, zfar).transpose(0, 1)
-    output.full_proj_transform = torch.matmul(output.world_view_transform, output.projection_matrix)  # 4, 4
-    output.camera_center = output.world_view_transform.inverse()[3:, :3]
+    # Use .float() to avoid AMP issues
+    output.world_view_transform = getWorld2View(R, T).transpose(0, 1).float()  # this is now to be right multiplied
+    output.projection_matrix = getProjectionMatrix(K, H, W, n, f).transpose(0, 1).float()  # this is now to be right multiplied
+    output.full_proj_transform = torch.matmul(output.world_view_transform, output.projection_matrix).float()   # 4, 4
+    output.camera_center = (-R.mT @ T)[..., 0].float()  # B, 3, 1 -> 3,
 
     # Set up rasterization configuration
-    output.tanfovx = math.tan(output.FoVx * 0.5)
-    output.tanfovy = math.tan(output.FoVy * 0.5)
+    output.tanfovx = np.tan(output.FoVx * 0.5)
+    output.tanfovy = np.tan(output.FoVy * 0.5)
 
     return output
 
@@ -634,14 +712,14 @@ class GaussianModel(nn.Module):
         # Exp on scaling, need to -> world space -> log
 
         # Doing inverse_sigmoid here will lead to NaNs
-        opacity = self._opacity
+        _opacity = self._opacity
         if self.opacity_activation != F.sigmoid and \
                 self.opacity_activation != torch.sigmoid and \
                 not isinstance(self.opacity_activation, nn.Sigmoid):
             opacity = self.opacity_activation(opacity)
             _opacity = inverse_sigmoid(opacity)
 
-        scale = self._scale
+        scale = self._scaling
         scale = self.scaling_activation(scale)
         _scale = torch.log(scale)
 
@@ -687,12 +765,19 @@ class GaussianModel(nn.Module):
 
         extra_f_names = [k for k in scalars.keys() if k.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
-        features_rest = torch.zeros((xyz.shape[0], len(extra_f_names), 1))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_rest[:, idx] = torch.from_numpy(np.asarray(scalars[attr_name]))
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_rest = features_rest.view(features_rest.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
+
+        # Load max_sh_degree from file
+        for i in range(4):
+            if len(extra_f_names) == 3 * (i + 1) ** 2 - 3:
+                self.max_sh_degree = i
+                # assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+                features_rest = torch.zeros((xyz.shape[0], len(extra_f_names), 1))
+
+                for idx, attr_name in enumerate(extra_f_names):
+                    features_rest[:, idx] = torch.from_numpy(np.asarray(scalars[attr_name]))
+
+                # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+                features_rest = features_rest.view(features_rest.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
 
         state_dict = dotdict()
         state_dict._xyz = xyz
@@ -705,7 +790,7 @@ class GaussianModel(nn.Module):
         self.load_state_dict(state_dict, strict=False)
         self.active_sh_degree.data.fill_(self.max_sh_degree)
 
-    def render(self, batch: dotdict):
+    def render(self, batch: dotdict, scale_mult: float = 1.0, alpha_mult: float = 1.0):
         # TODO: Make rendering function easier to read, now there're at least 3 types of gaussian rendering function
         from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
 
@@ -747,8 +832,8 @@ class GaussianModel(nn.Module):
             means2D=scr,
             shs=sh,
             colors_precomp=None,
-            opacities=occ,
-            scales=scale3,
+            opacities=occ * alpha_mult,
+            scales=scale3 * scale_mult,
             rotations=rot4,
             cov3D_precomp=None,
         )
@@ -982,3 +1067,48 @@ def naive_render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tens
         "visibility_filter": radii > 0,
         "radii": radii
     })
+
+
+def construct_list_of_attributes(self: dotdict):
+    l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+    # All channels except the 3 DC
+    for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+        l.append('f_dc_{}'.format(i))
+    for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+        l.append('f_rest_{}'.format(i))
+    l.append('opacity')
+    for i in range(self._scaling.shape[1]):
+        l.append('scale_{}'.format(i))
+    for i in range(self._rotation.shape[1]):
+        l.append('rot_{}'.format(i))
+    return l
+
+
+def save_gs(self: dotdict, path):
+    from plyfile import PlyData, PlyElement
+    os.makedirs(dirname(path), exist_ok=True)
+
+    # The original gaussian model uses a different activation
+    # Normalization for rotation, so no conversion
+    # Exp on scaling, need to -> world space -> log
+
+    # Doing inverse_sigmoid here will lead to NaNs
+    _opacity = self._opacity
+
+    _scale = self._scaling
+
+    xyz = self._xyz.detach().cpu().numpy()
+    normals = np.zeros_like(xyz)
+    f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+    f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+    opacities = _opacity.detach().cpu().numpy()
+    scale = _scale.detach().cpu().numpy()
+    rotation = self._rotation.detach().cpu().numpy()
+
+    dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(self)]
+
+    elements = np.empty(xyz.shape[0], dtype=dtype_full)
+    attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+    elements[:] = list(map(tuple, attributes))
+    el = PlyElement.describe(elements, 'vertex')
+    PlyData([el]).write(path)

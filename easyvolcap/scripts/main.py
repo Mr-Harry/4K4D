@@ -15,8 +15,8 @@ discover_modules() # will launch through this interface
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from easyvolcap.dataloaders.datasets.volumetric_video_dataset import VolumetricVideoDataset, WillChangeToNoopIfGUIDataset
     from easyvolcap.dataloaders.datasamplers import SequentialSampler, DistributedSampler, BatchSampler
-    from easyvolcap.dataloaders.datasets.volumetric_video_dataset import VolumetricVideoDataset
     from easyvolcap.dataloaders.volumetric_video_dataloader import VolumetricVideoDataloader
     from easyvolcap.models.volumetric_video_model import VolumetricVideoModel
     from easyvolcap.runners.volumetric_video_runner import VolumetricVideoRunner
@@ -80,7 +80,6 @@ def preflight(
     log(f"Starting experiment: {magenta(cfg.exp_name)}, command: {magenta(args.type)}")  # MARK: GLOBAL
 
 
-@catch_throw
 @callable_from_cfg
 def gui(
     viewer_cfg: dotdict = dotdict(type="VolumetricVideoViewer"),  # use different naming for config here, is this good?
@@ -112,6 +111,15 @@ def gui(
     #     Note that the viewer should also be a type of runner, we need to write it in a similar way to trainer or tester
     #     The camera class could only get K, R, T, and the rest like height or width are directly read from the viewer?
     #     * Should we just integrate the camera inside the viewer?
+
+    # Use NoopDataset if the original validation dataset is WillChangeToNoopIfGUIDataset
+    try:
+        kwargs = dotdict(kwargs)
+        if kwargs.val_dataloader_cfg.dataset_cfg.type == 'WillChangeToNoopIfGUIDataset':
+            kwargs.val_dataloader_cfg.dataset_cfg.type = 'NoopDataset'  # HACK: insider config
+    except:
+        pass
+
     runner: "VolumetricVideoRunner" = globals()[invokation_type](kwargs,
                                                                  base_device=base_device,
                                                                  dry_run=True,
@@ -122,7 +130,6 @@ def gui(
     launcher(**kwargs, runner_function=viewer.run, runner_object=runner)
 
 
-@catch_throw
 @callable_from_cfg
 def test(
     model_cfg: dotdict = dotdict(type="VolumetricVideoModel"),
@@ -174,7 +181,6 @@ def test(
     launcher(**kwargs, runner_function=runner.test, runner_object=runner)
 
 
-@catch_throw
 @callable_from_cfg
 def train(
     model_cfg: dotdict = dotdict(type="VolumetricVideoModel"),
@@ -260,9 +266,9 @@ def train(
     # The actual calling, with grace full exit
     launcher(**kwargs, runner_function=runner.train, runner_object=runner)
 
-
+@catch_throw
 def main():
-    if cfg.mocking: log(f'Modules imported. No config loaded for: {yellow(args.type)}, pass config file using `-c <PATH_TO_CONFIG>`')  # MARK: GLOBAL
+    if cfg.mocking: log(f'Modules imported. Mode: {yellow(args.type)}. No config loaded, pass config file using `-c <PATH_TO_CONFIG>`')  # MARK: GLOBAL
     else: globals()[args.type](cfg)  # invoke this (call callable_from_cfg -> call_from_cfg)
 
 

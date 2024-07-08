@@ -1,3 +1,4 @@
+from __future__ import annotations
 # fmt: off
 class Colors:
     """ ANSI color codes """
@@ -101,10 +102,10 @@ yaml.default_flow_style = None
 warnings.filterwarnings("ignore")  # ignore disturbing warnings
 os.environ["PYTHONBREAKPOINT"] = "easyvolcap.utils.console_utils.set_trace"
 
-slim_width = 140
+slim_width = None
 verbose_width = None
-slim_log_time = False
-slim_log_path = False
+slim_log_time = True
+slim_log_path = True
 slim_time_format = '%H:%M:%S'
 # slim_time_format = ''
 verbose_time_format = '%Y-%m-%d %H:%M:%S.%f'
@@ -116,7 +117,6 @@ traceback.install(console=console, width=slim_width)  # for colorful tracebacks
 pretty.install(console=console)
 
 NoneType = type(None)
-
 
 # NOTE: we use console.log for general purpose logging
 # Need to check its reliability and integratability
@@ -143,7 +143,9 @@ def stop_live():
 
 def start_live():
     global live
-    if live is not None: return
+    if live is not None:
+        live.start()
+        return
     live = Live(console=console, refresh_per_second=1)
     live.start()
 
@@ -204,7 +206,7 @@ def enable_progress():
     progress_disabled = False
 
 
-verbose_log = True
+verbose_log = False
 
 
 def disable_verbose_log():
@@ -225,7 +227,7 @@ def enable_verbose_log():
     console._log_render.time_format = verbose_time_format
 
 
-enable_verbose_log()
+disable_verbose_log()
 
 
 def set_trace(*args, **kwargs):
@@ -380,17 +382,27 @@ def run_if_not_exists(cmd, outname, *args, **kwargs):
         run(cmd, *args, **kwargs)
 
 
-def catch_throw(func: Callable):
-    # This function catches errors and stops the execution for easier inspection
-    def inner(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if isinstance(e, BdbQuit): return
-            log(red(f'Runtime exception: {e}'))
-            stacktrace()
-            post_mortem()
-    return inner
+def catch_throw(fatal: Union[Callable, bool] = True):
+    def wrapper(func: Callable):
+        # This function catches errors and stops the execution for easier inspection
+        def inner(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if isinstance(e, BdbQuit): return  # so that nested catch_throw will respect each other
+                log(red(f'Runtime exception: {e}'))
+                stacktrace()
+                post_mortem()
+                if fatal: exit(1)  # catched variable
+        return inner
+
+    if callable(fatal):
+        func = fatal
+        fatal = True
+        return wrapper(func)  # just a regular function decorator
+    else:
+        fatal = fatal  # whether this is a fatal post_mortem
+        return wrapper
 
 
 def print(*stuff,
@@ -618,6 +630,10 @@ class Timer:
         if self.record_to_file:
             self.timing_record = dotdict()
 
+        self.event_acc = dotdict()
+        self.event_last = dotdict()
+        self.event_denom = dotdict()
+
     def __enter__(self):
         self.start()
 
@@ -644,10 +660,25 @@ class Timer:
         if print: log(f"{(end - start) * 1000:8.3f} ms", self.name, back=back)  # 3 decimals, 3 digits
         return end - start  # return the difference
 
-    def record(self, event: str = ''):
+    def record(self, event: str = '', log_interval: float = -1):
         if self.disabled: return 0
         self.name = event
-        diff = self.stop(print=bool(event), back=3)
+
+        diff = self.stop(print=bool(event) and log_interval <= 0, back=3)
+        curr = time.perf_counter()
+        acc = self.event_acc.get(event, 0)
+        last = self.event_last.get(event, 0)
+        denom = self.event_denom.get(event, 0)
+
+        if (curr - last) > log_interval:  # if this is true, will never have printed
+            log(f"{(acc + diff) / (denom + 1) * 1000:8.3f} ms", event, back=3)
+            self.event_acc[event] = 0
+            self.event_denom[event] = 0
+            self.event_last[event] = curr
+        else:
+            self.event_acc[event] = acc + diff
+            self.event_denom[event] = denom + 1
+
         if self.record_to_file and event:
             if event not in self.timing_record:
                 self.timing_record[event] = []
@@ -655,6 +686,7 @@ class Timer:
 
             with open(join(self.record_dir, f'{self.exp_name}.json'), 'w') as f:
                 json.dump(self.timing_record, f, indent=4)
+
         self.start()
         return diff
 
@@ -730,7 +762,7 @@ def build_parser(d: dict, parser: argparse.ArgumentParser = None, **kwargs):
         kwargs['description'] = markup_to_ansi(green(kwargs['description']))
 
     if parser is None:
-        parser = argparse.ArgumentParser(formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=slim_width), **kwargs)
+        parser = argparse.ArgumentParser(formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=140), **kwargs)
 
     help_pattern = f'default = {blue("{}")}'
 
@@ -740,7 +772,8 @@ def build_parser(d: dict, parser: argparse.ArgumentParser = None, **kwargs):
                 # Use other params as kwargs
                 d = v.pop('default')
                 t = v.pop('type', type(d))
-                h = v.pop('help', markup_to_ansi(help_pattern.format(d)))
+                # h = v.pop('help', markup_to_ansi(help_pattern.format(d)))
+                h = (v.pop('help') + '; ' + markup_to_ansi(help_pattern.format(d))) if 'help' in v else markup_to_ansi(help_pattern.format(d))
                 parser.add_argument(f'--{k}', default=d, type=t, help=h, **v)
             else:
                 # TODO: Add argparse group here

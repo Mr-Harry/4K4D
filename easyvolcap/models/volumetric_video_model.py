@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from easyvolcap.runners.volumetric_video_viewer import VolumetricVideoViewer
+    from easyvolcap.runners.volumetric_video_runner import VolumetricVideoRunner
 
 import time
 import torch
@@ -26,8 +27,8 @@ from easyvolcap.models.samplers.importance_sampler import ImportanceSampler
 from easyvolcap.models.renderers.volume_renderer import VolumeRenderer
 from easyvolcap.models.supervisors.volumetric_video_supervisor import VolumetricVideoSupervisor
 
-# sampler (o, d, t -> z -> xyztθφ) ->
-# network (xyztθφ -> rgb, occ) ->
+# sampler (o, d, t -> z -> xyzt vd) ->
+# network (xyzt vd -> rgb, occ) ->
 # renderer (rgb, occ -> output) ->
 # supervisor (output, batch -> loss)
 
@@ -79,13 +80,20 @@ class VolumetricVideoModel(nn.Module):
         if hasattr(self.renderer, 'render_imgui'): self.renderer.render_imgui(viewer, batch)
         if hasattr(self.supervisor, 'render_imgui'): self.supervisor.render_imgui(viewer, batch)
 
+    def decorate_grad(self, runner: 'VolumetricVideoRunner', batch: dotdict):
+        if hasattr(self.camera, 'decorate_grad'): self.camera.decorate_grad(runner, batch)
+        if hasattr(self.sampler, 'decorate_grad'): self.sampler.decorate_grad(runner, batch)
+        if hasattr(self.network, 'decorate_grad'): self.network.decorate_grad(runner, batch)
+        if hasattr(self.renderer, 'decorate_grad'): self.renderer.decorate_grad(runner, batch)
+        if hasattr(self.supervisor, 'decorate_grad'): self.supervisor.decorate_grad(runner, batch)
+
     def render_volume(self, xyz: torch.Tensor, dir: torch.Tensor, t: torch.Tensor, dist: torch.Tensor, batch: dotdict):
         # Network
         rgb, occ = self.network.compute(xyz, dir, t, dist, batch)  # how to get annotation on forward params?
 
         # Prepare special data passing object
         output = batch.output  # will be integrated
-        del batch.output
+        # del batch.output
         return output
 
     def render_rays(self,  # used for vanialla NeRF training
@@ -126,7 +134,7 @@ class VolumetricVideoModel(nn.Module):
             batch.ray_o = to_x(batch.ray_o, self.dtype)
             batch.ray_d = to_x(batch.ray_d, self.dtype)
             if self.training or (self.apply_optcam and args.type != 'gui'):
-                batch.ray_o, batch.ray_d = self.camera.forward_rays(batch.ray_o, batch.ray_d, batch)
+                batch.ray_o, batch.ray_d = self.camera.forward_rays(batch.ray_o, batch.ray_d, batch, self.use_z_depth, self.correct_pix)
 
         if 't' in batch:
             batch.t = to_x(batch.t, self.dtype)
@@ -203,7 +211,7 @@ class VolumetricVideoModel(nn.Module):
             H, W, K, R, T = batch.meta.H[0].item(), batch.meta.W[0].item(), batch.K, batch.R, batch.T  # !: BATCH
             ray_o, ray_d, coords = get_rays(H, W, K, R, T, z_depth=self.use_z_depth, correct_pix=self.correct_pix, ret_coord=True)  # maybe without normalization
             ray_o, ray_d, coords = ray_o.view(-1, H * W, 3), ray_d.view(-1, H * W, 3), coords.view(-1, H * W, 2)
-            
+
             near, far = get_near_far_aabb(bounds, ray_o, ray_d)
             near, far = monotonic_near_far(near, far, n, f)
             t = t[..., None, None].expand(-1, *ray_o.shape[1:-1], 1)  # B, P, 1

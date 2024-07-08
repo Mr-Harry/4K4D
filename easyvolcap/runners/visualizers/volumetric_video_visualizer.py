@@ -42,7 +42,7 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
 
                  dpt_curve: str = 'normalize',  # looks good
                  dpt_mult: float = 1.0,
-                 dpt_cm: str = 'virdis' if args.type != 'gui' else 'linear',  # looks good
+                 dpt_cm: str = 'linear' if args.type != 'gui' else 'linear',  # looks good
                  ):
         super().__init__()
 
@@ -97,7 +97,12 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
 
             img = norm_curve_fn(output.norm_map)
             if self.store_ground_truth and 'norm' in batch:
-                img_gt = norm_curve_fn(batch.norm)
+                norm = batch.norm
+                norm = norm * 2 - 1
+                norm[..., 1] *= -1
+                norm[..., 2] *= -1
+                norm = norm * 0.5 + 0.5
+                img_gt = norm
 
         elif type == Visualization.DEPTH:
             if self.dpt_curve == 'linear':
@@ -105,6 +110,7 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
             else:
                 img = depth_curve_fn(output.dpt_map, cm=self.dpt_cm)
             # img = (img - 0.5) * self.dpt_mult + 0.5
+
             img = img * self.dpt_mult
             if self.store_ground_truth and 'dpt' in batch:
                 if self.dpt_curve == 'linear':
@@ -134,6 +140,21 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
             img = output.acc_map.expand(output.acc_map.shape[:-1] + (3,))
             if self.store_ground_truth and 'msk' in batch:
                 img_gt = batch.msk.expand(batch.msk.shape[:-1] + (3,))
+
+        elif type == Visualization.FLOW:
+            from torchvision.utils import flow_to_image
+            img = output.flo_map
+            B, P, C = output.flo_map.shape
+            H, W = batch.meta.H[0].item(), batch.meta.W[0].item()
+            img = output.flo_map.view(B, H, W, C).float()
+            img = img.permute(0, 3, 1, 2)  # B, 2, H, W
+            img = flow_to_image(img).view(B, -1, H * W).permute(0, 2, 1)  # B, H*W, 3
+            img = img.float() / 255.0
+            if self.store_ground_truth and 'flow' in batch:
+                img_gt = batch.flow.view(B, H, W, C).float()  # B, 2, H, W
+                img_gt = img_gt.permute(0, 3, 1, 2)  # B, 2, H, W
+                img_gt = flow_to_image(img_gt).view(B, -1, H * W).permute(0, 2, 1)  # B, H*W, 3
+                img_gt = img_gt.float() / 255.0
 
         # ... implement more
         elif type == Visualization.RENDER:
@@ -298,10 +319,10 @@ class VolumetricVideoVisualizer:  # this should act as a base class for other ty
                 result_str = f'"{result_dir}/*{self.vis_ext}"'
                 output_path = result_str[1:].split('*')[0][:-1] + '.mp4'
                 try:
-                    generate_video(result_str, output_path, self.video_fps)  # one video for one type?
+                    generate_video(result_str, output_path, fps=self.video_fps)  # one video for one type?
                 except RuntimeError as e:
                     log(yellow('Error encountered during video composition, will retry without hardware encoding'))
-                    generate_video(result_str, output_path, self.video_fps, hwaccel='none', preset='veryslow', vcodec='libx265')  # one video for one type?
+                    generate_video(result_str, output_path, fps=self.video_fps, hwaccel='none', preset='veryslow', vcodec='libx265')  # one video for one type?
                 log(f'Video generated: {blue(output_path)}')
                 # TODO: use timg/tiv to visaulize the video / image on disk to the commandline
 

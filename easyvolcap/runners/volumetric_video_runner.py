@@ -80,11 +80,14 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
                  test_use_amp: bool = False,
                  use_jit_trace: bool = False,  # almost will never work
                  use_jit_script: bool = False,  # almost will never work
+                 use_torch_compile: bool = False,  # almost will never work
+                 #  torch_compile_mode: str = None,
+                 torch_compile_mode: str = 'max-autotune-no-cudagraphs',
 
                  # Debugging
                  collect_timing: bool = False,  # will lose 1 fps over copying
                  timer_sync_cuda: bool = True,  # will explicitly call torch.cuda.synchronize() before collecting
-                 timer_record_to_file: bool = False, # will write to a json file for collected analysis of the timing
+                 timer_record_to_file: bool = False,  # will write to a json file for collected analysis of the timing
                  ):
         self.model = model  # possibly already a ddp model?
 
@@ -131,6 +134,8 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
         # Trace model for faster inference
         self.use_jit_script = use_jit_script
         self.use_jit_trace = use_jit_trace
+        self.use_torch_compile = use_torch_compile
+        self.torch_compile_mode = torch_compile_mode
 
         self.ignore_eval_error = ignore_eval_error
         self.record_images_to_tb = record_images_to_tb
@@ -139,7 +144,10 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
         self.test_using_inference_mode = test_using_inference_mode
 
         # Setting VRAM limit on Windows might make the framerate more stable
-        torch.cuda.set_per_process_memory_fraction(torch_vram_frac_limit)  # set vram usage limit to current device
+        try:
+            torch.cuda.set_per_process_memory_fraction(torch_vram_frac_limit)  # set vram usage limit to current device
+        except:
+            pass
 
         # HACK: GLOBAL VARIABLE, when dumping config, should ignore this one
         cfg.runner = self
@@ -260,14 +268,17 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
             log(red(e))
             torch.cuda.empty_cache()
 
-    def maybe_jit_model(self, batch: dotdict):
+    def maybe_jit_model(self, batch: dotdict = None):
         if not isinstance(self.model, torch.jit.ScriptModule):
             if self.use_jit_script:
-                log(green(f'Scripting the model for inference'))
+                log(green(f'Scripting the model'))
                 self.model = torch.jit.script(self.model)
             elif self.use_jit_trace:
-                log(green(f'Tracing the model for inference'))
+                log(green(f'Tracing the model'))
                 self.model = torch.jit.trace(self.model, batch)
+            elif self.use_torch_compile:
+                log(green(f'Compiling the model'))
+                self.model = torch.compile(self.model, mode=self.torch_compile_mode)
 
     # Single epoch testing api
     def test(self):  # from begin epoch
@@ -336,6 +347,7 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
         # Train for one epoch (iterator style)
         # Actual start of the execution
         epoch = begin_epoch  # set starting epoch
+        self.maybe_jit_model()
         self.model.train()  # set the network (model) to training mode (recursive to all modules)
         start_time = time.perf_counter()
         for index, batch in enumerate(self.dataloader):  # control number of iterations explicitly
@@ -358,6 +370,8 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
             self.scaler.scale(loss).backward()  # maybe perform AMP
             if self.clip_grad_norm > 0: torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
             if self.clip_grad_value > 0: torch.nn.utils.clip_grad_value_(self.model.parameters(), self.clip_grad_value)
+            if hasattr(self.model, 'decorate_grad'): self.model.decorate_grad(self, batch)  # perform some action on the gradients
+            elif hasattr(self.model, 'module') and hasattr(self.model.module, 'decorate_grad'): self.model.module.decorate_grad(self, batch)  # perform some action on the gradients
             self.scaler.step(self.optimizer)
             if not self.retain_last_grad: self.optimizer.zero_grad(set_to_none=True)
             self.scheduler.step()
@@ -372,7 +386,12 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
             if (iter + 1) % self.log_interval == 0 and not get_rank():
 
                 # For recording onto the tensorboard
-                scalar_stats = dotdict({k: v.mean().item() for k, v in scalar_stats.items()})  # MARK: sync (for accurate batch time)
+                scalar_stats = dotdict(
+                    {
+                        k: (v.mean().item() if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray) else v)
+                        for k, v in scalar_stats.items()
+                    }
+                )  # MARK: sync (for accurate batch time)
 
                 lr = self.optimizer.param_groups[0]['lr']  # TODO: skechy lr query, only lr of the first param will be saved
                 max_mem = torch.cuda.max_memory_allocated() / 2**20
@@ -422,12 +441,12 @@ class VolumetricVideoRunner:  # a plain and simple object controlling the traini
 
     def test_generator(self, epoch: int, yield_every: int = 1):
         # validation for one epoch
+        self.maybe_jit_model()
         self.model.train(self.test_using_train_mode)  # set the network (model) to training mode (recursive to all modules)
         for index, batch in enumerate(tqdm(self.val_dataloader, disable=not self.print_test_progress)):
             iter = epoch * self.ep_iter - 1  # some indexing trick
             batch = add_iter(batch, iter, self.total_iter)  # is this bad naming
             batch = to_cuda(batch)  # cpu -> cuda, note that DDP will move all cpu tensors to cuda as well
-            self.maybe_jit_model(batch)
             with torch.inference_mode(self.test_using_inference_mode), torch.no_grad(), torch.cuda.amp.autocast(enabled=self.test_use_amp, cache_enabled=self.test_amp_cached):
                 output: dotdict = self.model(batch)
                 scalar_stats = self.evaluator.evaluate(output, batch)

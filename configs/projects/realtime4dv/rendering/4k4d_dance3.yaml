@@ -6,9 +6,13 @@ configs:
     - configs/specs/legacy.yaml # MARK: this is an old model
     - configs/specs/superb.yaml # NOTE: real-time rendering
 
+dataloader_cfg:
+    dataset_cfg: &dataset_cfg
+        frame_sample: [0, 300, 1]
+
 val_dataloader_cfg:
     dataset_cfg:
-        init_viewer_index: 5
+        <<: *dataset_cfg
 
 model_cfg:
     sampler_cfg:

@@ -76,3 +76,5 @@ diff*.html
 # *info.json
 *.dump
 *.dmp
+*.exr
+*.bak

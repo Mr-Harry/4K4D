@@ -105,6 +105,7 @@ def read_pfm(filename):
 
 def generate_video(result_str: str,
                    output: str,
+                   verbose: bool = False,
                    fps: int = 30,
                    crf: int = 17,
                    cqv: int = 19,
@@ -118,14 +119,19 @@ def generate_video(result_str: str,
     cmd = [
         'ffmpeg',
         '-hwaccel', hwaccel,
+    ] + ([
         '-hide_banner',
         '-loglevel', 'error',
+    ] if not verbose else []) + ([
         '-framerate', fps,
+    ] if fps > 0 else []) + ([
         '-f', 'image2',
         '-pattern_type', 'glob',
+    ] if '*' in result_str else []) + ([
+        '-r', fps,
+    ] if fps > 0 else []) + [
         '-nostdin',  # otherwise you cannot chain commands together
         '-y',
-        '-r', fps,
         '-i', result_str,
         '-c:v', vcodec,
         '-preset', preset,
@@ -274,6 +280,7 @@ class Visualization(Enum):
     DEPTH = auto()  # needs a little bit extra computation
     ALPHA = auto()  # occupancy (rendered volume density)
     NORMAL = auto()  # needs extra computation
+    FLOW = auto()
     FEATURE = auto()  # embedder results
     SEMANTIC = auto()  # semantic nerf related
     SRCINPS = auto()  # Souce input images for image based rendering
@@ -292,6 +299,8 @@ class Visualization(Enum):
     POINT = auto()
     VOLUME = auto()
 
+    # Loss related output
+    IMAGE_LOSS_WEIGHT = auto()
 
 class DataSplit(Enum):
     TRAIN = auto()
@@ -550,7 +559,7 @@ def load_pts(filename: str):
     return verts, colors, norms, scalars
 
 
-def export_pts(pts: torch.Tensor, color: torch.Tensor = None, normal: torch.Tensor = None, scalars: dotdict = dotdict(), filename: str = "default.ply"):
+def export_pts(pts: torch.Tensor, color: torch.Tensor = None, normal: torch.Tensor = None, scalars: dotdict = dotdict(), filename: str = "default.ply", skip_color: bool = False, **kwargs):
     from pandas import DataFrame
     from pyntcloud import PyntCloud
 
@@ -567,13 +576,10 @@ def export_pts(pts: torch.Tensor, color: torch.Tensor = None, normal: torch.Tens
         data.red = (color[:, 0] * 255).astype(np.uint8)
         data.green = (color[:, 1] * 255).astype(np.uint8)
         data.blue = (color[:, 2] * 255).astype(np.uint8)
-    else:
+    elif not skip_color:
         data.red = (pts[:, 0] * 255).astype(np.uint8)
         data.green = (pts[:, 1] * 255).astype(np.uint8)
         data.blue = (pts[:, 2] * 255).astype(np.uint8)
-
-    # if 'alpha' in scalars:
-    #     data.alpha = (scalars.alpha * 255).astype(np.uint8)
 
     if normal is not None:
         normal = to_numpy(normal)
@@ -593,7 +599,7 @@ def export_pts(pts: torch.Tensor, color: torch.Tensor = None, normal: torch.Tens
     cloud = PyntCloud(df)  # construct the data
     dir = dirname(filename)
     if dir: os.makedirs(dir, exist_ok=True)
-    return cloud.to_file(filename)
+    return cloud.to_file(filename, **kwargs) # maybe write comments here: comments: list of strings
 
 
 def export_lines(verts: torch.Tensor, lines: torch.Tensor, color: torch.Tensor = None, filename: str = 'default.ply'):
@@ -1057,26 +1063,26 @@ def load_image_file(img_path: str, ratio=1.0):
         img = np.asarray(im)
         if np.issubdtype(img.dtype, np.integer):
             img = img.astype(np.float32) / np.iinfo(img.dtype).max  # normalize
-        if img.ndim == 2:
-            img = img[..., None]
         if ratio != 1.0 and \
             draft is None or \
                 draft is not None and \
-        (draft[1][2] != int(w * ratio) or
-             draft[1][3] != int(h * ratio)):
+            (draft[1][2] != int(w * ratio) or
+         draft[1][3] != int(h * ratio)):
             img = cv2.resize(img, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_AREA)
+        if img.ndim == 2:  # MARK: cv.resize will discard the last dimension of mask images
+            img = img[..., None]
         return img
     else:
         img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
         if img.ndim >= 3 and img.shape[-1] >= 3:
             img[..., :3] = img[..., [2, 1, 0]]  # BGR to RGB
-        if img.ndim == 2:
-            img = img[..., None]
         if np.issubdtype(img.dtype, np.integer):
             img = img.astype(np.float32) / np.iinfo(img.dtype).max  # normalize
         if ratio != 1.0:
             height, width = img.shape[:2]
             img = cv2.resize(img, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
+        if img.ndim == 2:  # MARK: cv.resize will discard the last dimension of mask images
+            img = img[..., None]
         return img
 
 
@@ -1090,6 +1096,9 @@ def load_depth(depth_file: str):
             depth = depth[..., None]  # H, W, 1
         depth = depth[..., :1]
     elif depth_file.endswith('.hdr') or depth_file.endswith('.exr'):
+        if depth_file.endswith('.exr'):
+            # ... https://github.com/opencv/opencv/issues/21326
+            os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
         depth = load_image(depth_file)
         depth = depth[..., :1]
     else:
@@ -1115,9 +1124,11 @@ def load_unchanged(img_path: str, ratio=1.0):
         if ratio != 1.0 and \
             draft is None or \
                 draft is not None and \
-        (draft[1][2] != int(w * ratio) or
-             draft[1][3] != int(h * ratio)):
+            (draft[1][2] != int(w * ratio) or \
+         draft[1][3] != int(h * ratio)):
             img = cv2.resize(img, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_AREA)
+        if img.ndim == 2:  # MARK: cv.resize will discard the last dimension of mask images
+            img = img[..., None]
         return img
     else:
         img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
@@ -1126,29 +1137,34 @@ def load_unchanged(img_path: str, ratio=1.0):
         if ratio != 1.0:
             height, width = img.shape[:2]
             img = cv2.resize(img, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
+        if img.ndim == 2:  # MARK: cv.resize will discard the last dimension of mask images
+            img = img[..., None]
         return img
 
 
 def load_mask(msk_path: str, ratio=1.0):
+    """
+    Load single-channel binary mask
+    """
     if msk_path.endswith('.jpg') or msk_path.endswith('.JPG') or msk_path.endswith('.jpeg') or msk_path.endswith('.JPEG'):
         msk = Image.open(msk_path)
         w, h = msk.width, msk.height
         draft = msk.draft('L', (int(w * ratio), int(h * ratio)))
         msk = np.asarray(msk).astype(int)  # read the actual file content from drafted disk
         msk = msk * 255 / msk.max()  # if max already 255, do nothing
-        # msk = msk[..., None] > 128
+        msk = msk[..., None] > 128  # make it binary
         msk = msk.astype(np.uint8)
         if ratio != 1.0 and \
             draft is None or \
                 draft is not None and \
-        (draft[1][2] != int(w * ratio) or
-             draft[1][3] != int(h * ratio)):
+            (draft[1][2] != int(w * ratio) or
+         draft[1][3] != int(h * ratio)):
             msk = cv2.resize(msk.astype(np.uint8), (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_NEAREST)[..., None]
         return msk
     else:
         msk = cv2.imread(msk_path, cv2.IMREAD_GRAYSCALE).astype(int)  # BGR to GRAY
         msk = msk * 255 / msk.max()  # if max already 255, do nothing
-        # msk = msk[..., None] > 128  # make it binary
+        msk = msk[..., None] > 128  # make it binary
         msk = msk.astype(np.uint8)
         if ratio != 1.0:
             height, width = msk.shape[:2]
@@ -1168,8 +1184,9 @@ def save_unchanged(img_path: str, img: np.ndarray, quality=100, compression=6):
 
 
 def save_image(img_path: str, img: np.ndarray, jpeg_quality=75, png_compression=9, save_dtype=np.uint8):
-    if isinstance(img, torch.Tensor): img = img.detach().cpu().numpy()
-    if img.ndim == 4: img = np.concatenate(img, axis=0)
+    if isinstance(img, torch.Tensor): img = img.detach().cpu().numpy()  # convert to numpy arrays
+    if img.ndim == 4: img = np.concatenate(img, axis=0)  # merge into one image along y axis
+    if img.ndim == 2: img = img[..., None]  # append last dim
     if img.shape[0] < img.shape[-1] and (img.shape[0] == 3 or img.shape[0] == 4): img = np.transpose(img, (1, 2, 0))
     if np.issubdtype(img.dtype, np.integer):
         img = img / np.iinfo(img.dtype).max  # to float
@@ -1194,6 +1211,8 @@ def save_image(img_path: str, img: np.ndarray, jpeg_quality=75, png_compression=
         # should we try to discard alpha channel here?
         # exr could store alpha channel
         pass  # no transformation for other unspecified file formats
+    # log(f'Writing image to: {img_path}')
+    # breakpoint()
     return cv2.imwrite(img_path, img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality,
                                        cv2.IMWRITE_PNG_COMPRESSION, png_compression,
                                        cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_PIZ])
@@ -1227,10 +1246,46 @@ def project(xyz, K, RT):
     K: [3, 3]
     RT: [3, 4]
     """
-    xyz = np.dot(xyz, RT[:, :3].T) + RT[:, 3:].T
-    xyz = np.dot(xyz, K.T)
-    xy = xyz[:, :2] / xyz[:, 2:]
+    if isinstance(xyz, torch.Tensor):
+        xyz = xyz @ RT[:, :3].T + RT[:, 3:].T
+        xyz = xyz @ K.T
+        xy = xyz[:, :2] / xyz[:, 2:]
+    elif isinstance(xyz, np.ndarray):
+        xyz = np.dot(xyz, RT[:, :3].T) + RT[:, 3:].T
+        xyz = np.dot(xyz, K.T)
+        xy = xyz[:, :2] / xyz[:, 2:]
     return xy
+
+
+def batch_project(xyz, K, RT, return_depth=False):
+    """
+    args: 
+        xyz: [B, N, 3]
+        K: [B, 3, 3]
+        RT: [B, 3, 4]
+        return_depth: bool
+    returns:
+        xy: [B, N, 2]
+        depth: [B, N]
+    """
+    B, N, _ = xyz.shape
+    device = xyz.device
+
+    # Homogeneous coordinates
+    xyz_hom = torch.cat([xyz, torch.ones(B, N, 1, device=device)], dim=-1)  # [B, N, 4]
+
+    # Projection matrix
+    P = torch.matmul(K, RT)  # [B, 3, 4]
+
+    # Project points
+    xyz_proj = torch.einsum('bni,bij->bnj', P, xyz_hom.permute(0, 2, 1)).permute(0, 2, 1)  # [B, N, 3]
+    depth = xyz_proj[..., 2]  # [B, N]
+    xy = xyz_proj[..., :2] / depth[..., None]  # [B, N, 2]
+
+    if return_depth:
+        return xy, depth
+    else:
+        return xy
 
 
 def unproject(depth, K, R, T):
@@ -1556,11 +1611,11 @@ def load_resize_undist_im_bytes(imp: str,
 
     oH, oW = img.shape[:2]
 
-    if dist_opt_K:
+    if dist_opt_K and np.sum(np.abs(D)) != 0.0:
         newCameraMatrix, _ = cv2.getOptimalNewCameraMatrix(K, D, (oW, oH), 0, (oW, oH))
         img = cv2.undistort(img, K, D, newCameraMatrix=newCameraMatrix)
         K = newCameraMatrix
-    else:
+    elif np.sum(np.abs(D)) != 0.0:
         img = cv2.undistort(img, K, D)
 
     # Maybe update image size
@@ -1691,6 +1746,7 @@ def decode_crop_fill_im_bytes(im_bytes: BytesIO,
 
     # Update the final size and intrinsics
     x, y, w, h = bx + mx, by + my, mw, mh  # w and h will always be the smaller one, xy will be accumulated
+    K = K.copy()  # stupid copy bug...
     K[0, 2] -= x
     K[1, 2] -= y
 

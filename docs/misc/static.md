@@ -114,10 +114,10 @@ The training should convert to a meaningful stage after 10-20 mins on a 3090 (ac
 
 ```shell
 # With your config files ready, you can run the following command to train the model
-evc -c configs/exps/l3mhet/l3mhet_${expname}.yaml
+evc-train -c configs/exps/l3mhet/l3mhet_${expname}.yaml
 
 # Now run the following command to render some output
-evc -t test -c configs/exps/l3mhet/l3mhet_${expname}.yaml,configs/specs/spiral.yaml
+evc-test -c configs/exps/l3mhet/l3mhet_${expname}.yaml,configs/specs/spiral.yaml
 ```
 [`configs/specs/spiral.yaml`](configs/specs/spiral.yaml): please check this file for more details, it's a collection of configurations to tell the dataloader and visualizer to generate a spiral path by interpolating the given cameras
 
@@ -131,7 +131,7 @@ After preparing the dataset and model with COLMAP and Instant-NGP following the 
 
 The original [3DGS](https://github.com/graphdeco-inria/gaussian-splatting) uses the sparse reconstruction result of COLMAP for initialization.
 However, we found that the sparse reconstruction result often contains a lot of floating points, which is hard to prune for 3DGS and could easily make the model fail to converge.
-Thus, we opted to use the "dense" reconstruction result of our Instant-NGP+T implementation by computing the RGBD image for input views and concatenating them as the input of 3DGS. The script [`volume_fusion.py`](scripts/tools/volume_fusion.py) controls this process and it should work similarly on all models that support depth output.
+Thus, we opted to use the "dense" reconstruction result of our Instant-NGP+T implementation by computing the RGBD image for input views and concatenating them as the input of 3DGS. The script [`volume_fusion.py`](scripts/fusion/volume_fusion.py) controls this process and it should work similarly on all models that support depth output.
 
 Following the official [Instant-NGP](https://github.com/NVlabs/instant-ngp) implementation, we also perform camera parameter optimizations during the training of the Instant-NGP+T model (extrinsic parameters for now).
 The script responsible for extracting the camera parameters is [`extract_optimized_cameras.py`](scripts/tools/extract_optimized_cameras.py).
@@ -146,7 +146,7 @@ python scripts/tools/extract_optimized_cameras.py -- -c configs/exps/l3mhet/l3mh
 
 # Extract geometry (point cloud) for initialization from the l3mhet model
 # Tune image sample rate and resizing ratio for a denser or sparser estimation
-python scripts/tools/volume_fusion.py -- -c configs/exps/l3mhet/l3mhet_${expname}.yaml val_dataloader_cfg.dataset_cfg.ratio=0.25 val_dataloader_cfg.dataset_cfg.view_sample=0,null,25
+python scripts/fusion/volume_fusion.py -- -c configs/exps/l3mhet/l3mhet_${expname}.yaml val_dataloader_cfg.dataset_cfg.ratio=0.25 val_dataloader_cfg.dataset_cfg.view_sample=0,null,25
 
 # Move the rendering results to the dataset folder
 mkdir -p ${data_root}/vhulls
@@ -164,13 +164,13 @@ The [`colmap.yaml`](configs/specs/colmap.yaml) provides some heuristics for larg
 
 ```shell
 # Train a 3DGS model on the ${expname} dataset
-evc -c configs/exps/gaussiant/gaussiant_${expname}.yaml
+evc-train -c configs/exps/gaussiant/gaussiant_${expname}.yaml
 
 # Perform rendering on the trained ${expname} dataset
-evc -t test -c configs/exps/gaussiant/gaussiant_${expname}.yaml,configs/specs/superm.yaml,configs/specs/spiral.yaml
+evc-test -c configs/exps/gaussiant/gaussiant_${expname}.yaml,configs/specs/superm.yaml,configs/specs/spiral.yaml
 
 # Perform rendering with GUI, do this on a machine with monitor, tested on Windows and Ubuntu
-evc -t gui -c configs/exps/gaussiant/gaussiant_${expname}.yaml,configs/specs/superm.yaml
+evc-gui -c configs/exps/gaussiant/gaussiant_${expname}.yaml,configs/specs/superm.yaml
 ```
 
 The [`superm.yaml`](configs/specs/superm.yaml) skips the loading of input images and other initializations for network-only rendering since all the information we need is contained inside the trained model.
@@ -185,15 +185,15 @@ Pre-trained model for ENeRFi on the DTU dataset can be downloaded from [this Goo
 
 ```shell
 # Render ENeRF with GUI on zju3dv dataset
-evc -t gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True
+evc-gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True
 
 # Render ENeRF with GUI on zju3dv dataset using fp16, higher performance, worse results on some views
-evc -t gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml,configs/specs/fp16.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True # only cache ten images
+evc-gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml,configs/specs/fp16.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True # only cache ten images
 
 # Render ENeRF on zju3dv dataset with spiral paths
-evc -t test -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml,configs/specs/spiral.yaml,configs/specs/ibr.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.render_size=768,1366 runner_cfg.visualizer_cfg.save_tag=zju3dv
+evc-test -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/zju/zju3dv.yaml,configs/specs/optimized.yaml,configs/specs/spiral.yaml,configs/specs/ibr.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.cache_raw=False val_dataloader_cfg.dataset_cfg.ratio=1.0 val_dataloader_cfg.dataset_cfg.view_sample=0,None,5 val_dataloader_cfg.dataset_cfg.force_sparse_view=True val_dataloader_cfg.dataset_cfg.n_srcs_list=3, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.render_size=768,1366 runner_cfg.visualizer_cfg.save_tag=zju3dv
 
 # Render ENeRF with GUI on RenBody dataset
-evc -t gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/renbody/0013_01_obj.yaml,configs/specs/optimized.yaml,configs/specs/mask.yaml,configs/specs/vf0.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.n_srcs_list=4, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.ratio=1.0
-evc -t gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/renbody/0008_01_obj.yaml,configs/specs/optimized.yaml,configs/specs/mask.yaml,configs/specs/vf0.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.n_srcs_list=4, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.ratio=1.0
+evc-gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/renbody/0013_01_obj.yaml,configs/specs/optimized.yaml,configs/specs/mask.yaml,configs/specs/vf0.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.n_srcs_list=4, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.ratio=1.0
+evc-gui -c configs/base.yaml,configs/models/enerfi.yaml,configs/datasets/renbody/0008_01_obj.yaml,configs/specs/optimized.yaml,configs/specs/mask.yaml,configs/specs/vf0.yaml exp_name=enerfi_dtu val_dataloader_cfg.dataset_cfg.n_srcs_list=4, val_dataloader_cfg.dataset_cfg.use_vhulls=True val_dataloader_cfg.dataset_cfg.ratio=1.0
 ```
